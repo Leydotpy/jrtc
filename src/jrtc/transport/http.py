@@ -23,6 +23,7 @@ from jrtc.core.exceptions import (
     JanusTransportError,
 )
 from jrtc.models import JanusRequest, JanusResponse
+from jrtc.models.common import JanusId, validate_janus_id
 from jrtc.models.request import (
     ClaimSessionRequest,
     CreateSessionRequest,
@@ -118,8 +119,8 @@ class HttpTransportClient:
         self._open = client is not None
         self._message_listeners: set[MessageListener] = set()
         self._close_listeners: set[CloseListener] = set()
-        self._pollers: dict[str, asyncio.Task[None]] = {}
-        self._poll_credentials: dict[str, dict[str, str]] = {}
+        self._pollers: dict[int, asyncio.Task[None]] = {}
+        self._poll_credentials: dict[int, dict[str, str]] = {}
         self._pending: dict[str, _Pending] = {}
         self._pending_slots = asyncio.Semaphore(max_pending_transactions)
         self._state_lock = asyncio.Lock()
@@ -198,12 +199,12 @@ class HttpTransportClient:
             await self._notify_close(error)
 
     @staticmethod
-    def _ids(message: JanusRequest) -> tuple[str | None, str | None]:
+    def _ids(message: JanusRequest) -> tuple[JanusId | None, JanusId | None]:
         session = getattr(message, "session_id", None)
         handle = getattr(message, "handle_id", None)
         return (
-            None if session is None else str(session),
-            None if handle is None else str(handle),
+            None if session is None else validate_janus_id(session, name="session_id"),
+            None if handle is None else validate_janus_id(handle, name="handle_id"),
         )
 
     def _endpoint(self, message: JanusRequest) -> str:
@@ -281,11 +282,11 @@ class HttpTransportClient:
                             else None
                         )
                         if activated_id is not None:
-                            self._start_poller(str(activated_id), message)
+                            self._start_poller(activated_id, message)
 
                     result = await future
                     if isinstance(message, DestroySessionRequest):
-                        await self._stop_poller(str(message.session_id))
+                        await self._stop_poller(message.session_id)
                     return result
         except TimeoutError as exc:
             raise JanusRequestTimeout(transaction, effective) from exc
@@ -297,7 +298,7 @@ class HttpTransportClient:
                 if not future.done():
                     future.cancel()
 
-    def _start_poller(self, session_id: str, request: JanusRequest) -> None:
+    def _start_poller(self, session_id: JanusId, request: JanusRequest) -> None:
         if session_id in self._pollers:
             return
         self._poll_credentials[session_id] = self._credentials(request)
@@ -305,19 +306,19 @@ class HttpTransportClient:
             self._poll(session_id), name=f"janus-http-poll-{session_id}"
         )
 
-    async def _stop_poller(self, session_id: str) -> None:
+    async def _stop_poller(self, session_id: JanusId) -> None:
         task = self._pollers.pop(session_id, None)
         self._poll_credentials.pop(session_id, None)
         if task is not None and task is not asyncio.current_task():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    async def release_session(self, session_id: str | int) -> None:
+    async def release_session(self, session_id: JanusId) -> None:
         """Stop long-poll ownership after a session's local lifecycle ends."""
 
-        await self._stop_poller(str(session_id))
+        await self._stop_poller(validate_janus_id(session_id, name="session_id"))
 
-    async def _poll(self, session_id: str) -> None:
+    async def _poll(self, session_id: JanusId) -> None:
         delay = 0.25
         try:
             while self.open and session_id in self._pollers:

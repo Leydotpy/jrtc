@@ -19,6 +19,7 @@ from jrtc.core.exceptions import JanusConnectionClosed, PluginLoadError
 from jrtc.lib.registry import Registry
 from jrtc.models import JanusResponse
 from jrtc.models.base import Jsep
+from jrtc.models.common import JanusId, validate_janus_id
 from jrtc.models.request import (
     HangupRequest,
     PluginMessageRequest,
@@ -33,7 +34,7 @@ Listener = Callable[[Any], Awaitable[Any] | Any]
 
 class PluginOptions(TypedDict, total=False):
     identifier: str
-    plugin_id: str | int
+    plugin_id: JanusId
     session: Any
     on_event: Listener
     event_queue_size: int
@@ -99,7 +100,7 @@ class Plugin:
         self,
         *,
         session: Any,
-        plugin_id: str | int | None = None,
+        plugin_id: JanusId | None = None,
         identifier: str | None = None,
         on_event: Listener | None = None,
         event_queue_size: int = 1024,
@@ -110,7 +111,9 @@ class Plugin:
         if event_queue_size < 1:
             raise ValueError("event_queue_size must be positive")
         self._session = session
-        self._plugin_id = plugin_id
+        self._plugin_id: JanusId | None = (
+            None if plugin_id is None else validate_janus_id(plugin_id, name="plugin_id")
+        )
         self._listeners: dict[str, list[Listener]] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
         self._lifecycle_lock = asyncio.Lock()
@@ -131,7 +134,7 @@ class Plugin:
     def id(self) -> int:
         if self._plugin_id is None:
             raise RuntimeError("plugin has not been attached")
-        return int(self._plugin_id)
+        return self._plugin_id
 
     @property
     def session(self) -> Any:
@@ -305,7 +308,10 @@ class Plugin:
                 return self
             if not self.name:
                 raise TypeError(f"{type(self).__name__} must define the Janus plugin package name")
-            handle_id = await self.session.attach(self.name, opaque_id=opaque_id)
+            handle_id = validate_janus_id(
+                await self.session.attach(self.name, opaque_id=opaque_id),
+                name="handle_id",
+            )
             self._plugin_id = handle_id
             try:
                 if not getattr(self.session, "ready", True):

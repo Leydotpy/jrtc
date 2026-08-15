@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 from jrtc.auth import JanusCredentials
 from jrtc.conf import settings
+from jrtc.models.common import JanusId
 from jrtc.session.base import SessionState
 from jrtc.session.websocket import WebsocketSession
 
@@ -67,7 +68,7 @@ class JanusSessionManager:
 
     def _default_session_factory(self) -> WebsocketSession:
         token = settings.JANUS_TOKEN
-        api_secret = settings.jrtc_SECRET
+        api_secret = settings.JANUS_API_SECRET
         credentials = (
             JanusCredentials(token=token, api_secret=api_secret)
             if token is not None or api_secret is not None
@@ -291,7 +292,7 @@ class JanusSessionManager:
         await self.stop()
 
 
-def get_session(session_id: str | int | None = None) -> WebsocketSession:
+def get_session(session_id: JanusId | None = None) -> WebsocketSession:
     """Compatibility constructor; unlike 2.x it always returns a new instance."""
 
     return WebsocketSession(session_id=session_id)

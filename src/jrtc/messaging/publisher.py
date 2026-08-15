@@ -27,8 +27,9 @@ from jrtc.messaging.constants import (
 )
 from jrtc.messaging.metrics import LogVistaMetrics
 from jrtc.models import JanusResponse
+from jrtc.models.common import JanusId, validate_janus_id
 
-type JanusIdentifier = str | int
+type JanusIdentifier = JanusId
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,8 +519,10 @@ class JanusEventPublisher:
         session_id: JanusIdentifier | None,
         sender: JanusIdentifier | None,
     ) -> str:
-        session = "-" if session_id is None else str(session_id)
-        handle = "-" if sender is None else str(sender)
+        session = (
+            "-" if session_id is None else str(validate_janus_id(session_id, name="session_id"))
+        )
+        handle = "-" if sender is None else str(validate_janus_id(sender, name="sender"))
         return f"{session}:{handle}"
 
     def _shard(self, ordering_key: str) -> int:

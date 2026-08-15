@@ -11,20 +11,21 @@ from jrtc.messaging import (
     LogVistaMetrics,
     create_broker,
 )
-from jrtc.models import JanusRequest, JanusResponse
+from jrtc.models import JanusId, JanusRequest, JanusResponse
 from jrtc.session import JanusSession, SessionState, WebsocketSession
 from jrtc.transport import JanusTransport, WebsocketTransportClient
 
 try:
     __version__ = version("jrtc")
 except PackageNotFoundError:  # source checkout
-    __version__ = "3.1.0"
+    __version__ = "3.1.1"
 
 
 __all__ = (
     "JanusCredentialProvider",
     "JanusCredentials",
     "JanusEventPublisher",
+    "JanusId",
     "JanusRequest",
     "JanusResponse",
     "JanusResponseDispatcher",

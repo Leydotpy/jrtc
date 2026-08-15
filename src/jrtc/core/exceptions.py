@@ -9,6 +9,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from logvista import get_logger
+
+logger = get_logger(__name__)
+
 
 class JanusException(Exception):
     """Base class for errors raised by the toolkit."""
@@ -36,7 +40,16 @@ class JanusRequestTimeout(JanusTransportError, TimeoutError):
     def __init__(self, transaction: str, timeout: float) -> None:
         self.transaction = transaction
         self.timeout = timeout
-        super().__init__(f"Janus transaction {transaction!r} timed out after {timeout:g}s")
+        message = f"Janus transaction {transaction!r} timed out after {timeout:g}s"
+        super().__init__(message)
+        logger.error(
+            "Timeout Error",
+            message=message,
+            context={
+                "transaction": transaction,
+                "timeout": timeout,
+            }
+        )
 
 
 class JanusErrorResponse(JanusException):
@@ -54,7 +67,19 @@ class JanusErrorResponse(JanusException):
         self.reason = reason
         self.transaction = transaction
         self.response = response
-        super().__init__(f"Janus error {code}: {reason}")
+        title = f"Janus error {code}: {reason}"
+        message = f"Janus error {code!r} returned {reason!r}"
+        super().__init__(title)
+        logger.error(
+            title,
+            message=message,
+            context={
+                "code": code,
+                "reason": reason,
+                "transaction": transaction,
+                "response": response,
+            }
+        )
 
 
 class PluginManagerError(JanusException):

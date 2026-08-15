@@ -8,17 +8,26 @@ from uuid import uuid4
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 
-def _validate_janus_id(value: Any) -> int | str:
-    if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ValueError("Janus IDs must be positive integers or non-empty strings")
-    if isinstance(value, int) and value <= 0:
-        raise ValueError("numeric Janus IDs must be positive")
-    if isinstance(value, str) and (not value or value.strip() != value):
-        raise ValueError("string Janus IDs must be non-empty and contain no outer whitespace")
+def validate_janus_id(value: Any, *, name: str = "Janus ID") -> int:
+    """Return one protocol ID without coercing strings or booleans.
+
+    Janus session and plugin-handle identifiers are JSON integers.  Keeping
+    this check available outside Pydantic prevents plain Python registries and
+    lifecycle constructors from weakening that wire-level contract.
+    """
+
+    if type(value) is not int:
+        raise ValueError(f"{name} must be a positive integer")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
     return value
 
 
-type JanusId = Annotated[int | str, BeforeValidator(_validate_janus_id)]
+type JanusId = Annotated[
+    int,
+    Field(strict=True, gt=0),
+    BeforeValidator(validate_janus_id),
+]
 type JsonObject = dict[str, Any]
 type HeadersMap = dict[str, str]
 type StringList = list[str]

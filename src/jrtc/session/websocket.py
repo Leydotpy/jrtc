@@ -10,6 +10,7 @@ from typing import Any, Self
 from logvista import get_logger
 
 from jrtc.core.exceptions import JanusConnectionClosed
+from jrtc.models.common import JanusId, validate_janus_id
 from jrtc.models.request import (
     ClaimSessionRequest,
     CreateSessionRequest,
@@ -107,7 +108,7 @@ class JanusSession(AbstractBaseSession):
                     self._transport = None
                 raise
 
-    async def claim(self, session_id: str | int) -> Self:
+    async def claim(self, session_id: JanusId) -> Self:
         """Reclaim a timed-out Janus session when the server permits it.
 
         Janus must be configured with a non-zero ``reclaim_session_timeout``.
@@ -116,7 +117,7 @@ class JanusSession(AbstractBaseSession):
 
         if self.state not in {SessionState.NEW, SessionState.LOST}:
             raise RuntimeError(f"session cannot be claimed while state={self.state}")
-        self._claim_session_id = session_id
+        self._claim_session_id = validate_janus_id(session_id, name="session_id")
         return await self.create()
 
     def _invalidate(self, reason: str) -> None:

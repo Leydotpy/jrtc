@@ -61,7 +61,7 @@ JANUS_KEEPALIVE_FAILURES = _integer("JANUS_KEEPALIVE_FAILURES", 3, minimum=1)
 JANUS_SHUTDOWN_TIMEOUT = _number("JANUS_SHUTDOWN_TIMEOUT", 10.0, minimum=0.001)
 JANUS_DETACH_CONCURRENCY = _integer("JANUS_DETACH_CONCURRENCY", 16, minimum=1)
 JANUS_TOKEN = _optional("JANUS_TOKEN")
-jrtc_SECRET = _optional("jrtc_SECRET")
+JANUS_API_SECRET = _optional("JANUS_API_SECRET")
 
 # Transport-originated WebRTC events.  All logical ``janus.*`` event types are
 # mapped to one portable physical destination so Redis Streams, RabbitMQ and

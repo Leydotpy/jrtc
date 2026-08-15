@@ -18,7 +18,7 @@ def extract_plugin_data(response: JanusResponse) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def extract_response_id(response: JanusResponse) -> str | int | None:
+def extract_response_id(response: JanusResponse) -> int | None:
     data = getattr(response, "data", None)
     return getattr(data, "id", None)
 

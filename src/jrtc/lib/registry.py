@@ -72,7 +72,7 @@ class Registry[T](MutableMapping[str, type[T]]):
         if registered is None:
             raise PluginNotRegistered(
                 f"No Janus plugin is registered as {key!r}. Install the matching "
-                "janus-*-plugin distribution or import a custom Plugin subclass."
+                "jrtc-* distribution or import a custom Plugin subclass."
             )
         return registered
 

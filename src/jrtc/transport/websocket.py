@@ -239,6 +239,7 @@ class WebsocketTransportClient:
                         context={
                             "janus_type": message.janus,
                             "pending": len(self._transactions),
+                            "payload": payload,
                         },
                     )
                     return await future

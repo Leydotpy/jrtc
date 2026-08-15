@@ -2,7 +2,7 @@
 
 from jrtc.conf.settings.global_settings import (
     DEBUG,
-    jrtc_SECRET,
+    JANUS_API_SECRET,
     JANUS_BROKER_ADMISSION_TIMEOUT,
     JANUS_BROKER_DRAIN_TIMEOUT,
     JANUS_BROKER_ENGINE,
@@ -24,7 +24,7 @@ from jrtc.conf.settings.global_settings import (
 
 __all__ = [
     "DEBUG",
-    "jrtc_SECRET",
+    "JANUS_API_SECRET",
     "JANUS_BROKER_ADMISSION_TIMEOUT",
     "JANUS_BROKER_DRAIN_TIMEOUT",
     "JANUS_BROKER_ENGINE",

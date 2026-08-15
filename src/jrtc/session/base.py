@@ -22,15 +22,18 @@ from jrtc.core.exceptions import (
 )
 from jrtc.lib.manager import PluginManager
 from jrtc.models import JanusRequest, JanusResponse
+from jrtc.models.common import JanusId, validate_janus_id
 from jrtc.models.request import AttachPluginRequest, DetachPluginRequest
 from jrtc.models.response import SuccessResponse
 from jrtc.transport.base import JanusTransport
 from jrtc.transport.websocket import WebsocketTransportClient
 
+from logvista import get_logger
+
 if TYPE_CHECKING:
     from jrtc.messaging import JanusEventPublisher
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 TransportFactory = Callable[[], JanusTransport | Awaitable[JanusTransport]]
 
@@ -87,7 +90,7 @@ class AbstractBaseSession:
     def __init__(
         self,
         *,
-        session_id: str | int | None = None,
+        session_id: JanusId | None = None,
         transport: JanusTransport | None = None,
         transport_factory: TransportFactory | None = None,
         url: str | None = None,
@@ -95,8 +98,10 @@ class AbstractBaseSession:
         request_timeout: float | None = None,
         event_publisher: JanusEventPublisher | None = None,
     ) -> None:
-        self._session_id: str | int | None = None
-        self._claim_session_id: str | int | None = session_id
+        self._session_id: JanusId | None = None
+        self._claim_session_id: JanusId | None = (
+            None if session_id is None else validate_janus_id(session_id, name="session_id")
+        )
         self._state = SessionState.NEW
         self._transport = transport
         self._owns_transport = transport is None
@@ -136,7 +141,7 @@ class AbstractBaseSession:
         self._transport_listeners_registered = False
         self._setup_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
-        self._lost_session_id: str | int | None = None
+        self._lost_session_id: JanusId | None = None
         self._cleanup_tasks: set[asyncio.Task[Any]] = set()
         self._event_dispatcher = Dispatcher(name="janus.session.events")
         self._event_dispatcher.add(
@@ -154,7 +159,7 @@ class AbstractBaseSession:
     def id(self) -> int:
         if self._session_id is None:
             raise RuntimeError(f"session has no active ID (state={self._state})")
-        return int(self._session_id)
+        return self._session_id
 
     @property
     def state(self) -> SessionState:
@@ -170,7 +175,7 @@ class AbstractBaseSession:
         )
 
     @property
-    def lost_session_id(self) -> str | int | None:
+    def lost_session_id(self) -> JanusId | None:
         return self._lost_session_id
 
     @property
@@ -247,7 +252,7 @@ class AbstractBaseSession:
             raise JanusConnectionClosed("session was lost while the request was in flight")
         return response
 
-    async def attach(self, plugin: str, *, opaque_id: str | None = None) -> str | int:
+    async def attach(self, plugin: str, *, opaque_id: str | None = None) -> JanusId:
         if not self.ready:
             raise JanusConnectionClosed("session must be active before attaching a plugin")
         response = await self.send(
@@ -269,8 +274,8 @@ class AbstractBaseSession:
             raise JanusConnectionClosed("session was lost while attaching a plugin handle")
         return response.data.id
 
-    async def detach(self, handle_id: str | int) -> str | int:
-        key = str(handle_id)
+    async def detach(self, handle_id: JanusId) -> JanusId:
+        handle_id = validate_janus_id(handle_id, name="handle_id")
         if self._state in {SessionState.ACTIVE, SessionState.CLOSING}:
             try:
                 request = DetachPluginRequest(session_id=self.id, handle_id=handle_id)
@@ -284,10 +289,10 @@ class AbstractBaseSession:
                     )
             finally:
                 with suppress(PluginNotRegistered):
-                    self._plugins.unregister(key)
+                    self._plugins.unregister(handle_id)
         else:
             with suppress(PluginNotRegistered):
-                self._plugins.unregister(key)
+                self._plugins.unregister(handle_id)
         return handle_id
 
     def _route_event(self, response: JanusResponse) -> None:
@@ -297,7 +302,7 @@ class AbstractBaseSession:
         if (
             response_session_id is not None
             and self._session_id is not None
-            and str(response_session_id) != str(self._session_id)
+            and response_session_id != self._session_id
         ):
             return
         self._event_dispatcher.dispatch(
@@ -338,11 +343,19 @@ class AbstractBaseSession:
                 try:
                     task = asyncio.create_task(close())
                 except RuntimeError:
-                    logger.debug("No event loop available to close invalidated plugin")
+                    logger.debug(
+                        "Handle invalidation!",
+                        "No event loop available to close invalidated plugin",
+                        context={
+                            "session": self._lost_session_id,
+                            "state": self._state,
+                            "plugin": plugin,
+                        }
+                    )
                 else:
                     self._cleanup_tasks.add(task)
                     task.add_done_callback(self._cleanup_tasks.discard)
-        logger.warning("Janus session invalidated: %s", reason)
+        logger.warning("Janus session invalidated: %s", reason, context={"session": self._lost_session_id})
 
     async def _close_local(self) -> None:
         self._unregister_transport_listeners()

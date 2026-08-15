@@ -8,27 +8,29 @@ from typing import TypeVar, overload
 from logvista import get_logger, lazy
 
 from jrtc.core.exceptions import PluginAlreadyRegistered, PluginNotRegistered
+from jrtc.models.common import JanusId, validate_janus_id
 
 logger = get_logger(__name__)
 
 D = TypeVar("D")
 
 
-class PluginManager[P](MutableMapping[str, P]):
+class PluginManager[P](MutableMapping[int, P]):
     """A small handle registry owned by exactly one Janus session.
 
-    Janus IDs may arrive as JSON numbers while application code stores strings.
-    Keys are normalized at every boundary to prevent dropped events.
+    Janus handle IDs remain positive integers from response parsing through
+    registration and event dispatch.  Invalid caller-provided keys are
+    rejected instead of being normalized into a second representation.
     """
 
     def __init__(self) -> None:
-        self._registry: dict[str, P] = {}
+        self._registry: dict[int, P] = {}
 
     @staticmethod
-    def _key(handle_id: str | int) -> str:
-        return str(handle_id)
+    def _key(handle_id: JanusId) -> int:
+        return validate_janus_id(handle_id, name="handle_id")
 
-    def register(self, handle_id: str | int, plugin: P, *, replace: bool = False) -> None:
+    def register(self, handle_id: JanusId, plugin: P, *, replace: bool = False) -> None:
         key = self._key(handle_id)
         current = self._registry.get(key)
         if current is plugin:
@@ -48,7 +50,7 @@ class PluginManager[P](MutableMapping[str, P]):
             ),
         )
 
-    def unregister(self, handle_id: str | int) -> P:
+    def unregister(self, handle_id: JanusId) -> P:
         key = self._key(handle_id)
         try:
             plugin = self._registry.pop(key)
@@ -66,7 +68,7 @@ class PluginManager[P](MutableMapping[str, P]):
         )
         return plugin
 
-    def dispatch(self, handle_id: str | int, event: object) -> None:
+    def dispatch(self, handle_id: JanusId, event: object) -> None:
         plugin = self.get(handle_id)
         if plugin is None:
             raise PluginNotRegistered(f"Plugin handle {handle_id!r} is not registered")
@@ -95,35 +97,35 @@ class PluginManager[P](MutableMapping[str, P]):
             ),
         )
 
-    def __getitem__(self, handle_id: str) -> P:
+    def __getitem__(self, handle_id: int) -> P:
         key = self._key(handle_id)
         try:
             return self._registry[key]
         except KeyError as exc:
             raise PluginNotRegistered(f"Plugin handle {key!r} is not registered") from exc
 
-    def __setitem__(self, handle_id: str, plugin: P) -> None:
+    def __setitem__(self, handle_id: int, plugin: P) -> None:
         self.register(handle_id, plugin)
 
-    def __delitem__(self, handle_id: str) -> None:
+    def __delitem__(self, handle_id: int) -> None:
         self.unregister(handle_id)
 
-    def __iter__(self) -> Iterator[str]:
+    def __iter__(self) -> Iterator[int]:
         return iter(tuple(self._registry))
 
     def __len__(self) -> int:
         return len(self._registry)
 
     @overload
-    def get(self, handle_id: str | int) -> P | None: ...
+    def get(self, handle_id: JanusId) -> P | None: ...
 
     @overload
-    def get(self, handle_id: str | int, default: P) -> P: ...
+    def get(self, handle_id: JanusId, default: P) -> P: ...
 
     @overload
-    def get(self, handle_id: str | int, default: D) -> P | D: ...
+    def get(self, handle_id: JanusId, default: D) -> P | D: ...
 
-    def get(self, handle_id: str | int, default: D | None = None) -> P | D | None:
+    def get(self, handle_id: JanusId, default: D | None = None) -> P | D | None:
         return self._registry.get(self._key(handle_id), default)
 
     def clear(self) -> None:
@@ -145,5 +147,5 @@ class PluginManager[P](MutableMapping[str, P]):
             if callable(stop):
                 stop()
 
-    def as_dict(self) -> dict[str, P]:
+    def as_dict(self) -> dict[int, P]:
         return dict(self._registry)

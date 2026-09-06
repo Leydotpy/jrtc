@@ -61,10 +61,15 @@ class JanusSession(AbstractBaseSession):
                 return self
             if self.state in {SessionState.CLOSING, SessionState.CLOSED}:
                 raise RuntimeError("closed sessions cannot be recreated")
+            if self.state is SessionState.LOST:
+                # A claim/new activation may never overlap cleanup from the
+                # transport generation that owned the stale handles.
+                await self._drain_cleanup_tasks()
             old_keepalive, self._keepalive_task = self._keepalive_task, None
             if old_keepalive is not None and old_keepalive is not asyncio.current_task():
                 old_keepalive.cancel()
                 await asyncio.gather(old_keepalive, return_exceptions=True)
+            self._generation += 1
             self._state = SessionState.CREATING
             try:
                 await self._setup()
@@ -101,7 +106,11 @@ class JanusSession(AbstractBaseSession):
                 )
                 return self
             except BaseException:
-                self._state = SessionState.NEW
+                # A transport close callback may already have fenced this
+                # generation.  Do not erase LOST and hide the notification
+                # from the manager's health-sweep safety net.
+                if self._state is not SessionState.LOST:
+                    self._state = SessionState.NEW
                 if self._owns_transport and self._transport is not None:
                     self._unregister_transport_listeners()
                     await self._transport.stop()
@@ -120,9 +129,9 @@ class JanusSession(AbstractBaseSession):
         self._claim_session_id = validate_janus_id(session_id, name="session_id")
         return await self.create()
 
-    def _invalidate(self, reason: str) -> None:
+    def _invalidate(self, reason: str, *, error: BaseException | None = None) -> None:
         previous = self.state
-        super()._invalidate(reason)
+        super()._invalidate(reason, error=error)
         if previous in {SessionState.CLOSING, SessionState.CLOSED, SessionState.LOST}:
             return
         keepalive = self._keepalive_task
@@ -148,11 +157,20 @@ class JanusSession(AbstractBaseSession):
                     failures += 1
                     logger.warning(
                         "Keepalive warning",
-                        f"Janus keepalive failed ({failures}/{self._keepalive_failures}): {exc!s}",
-                        exc,
+                        "A Janus session keepalive failed",
+                        context={
+                            "error_type": type(exc).__name__,
+                            "failures": failures,
+                            "failure_threshold": self._keepalive_failures,
+                            "generation": self._generation,
+                            "session_id": self._session_id,
+                        },
                     )
                     if failures >= self._keepalive_failures:
-                        self._invalidate("keepalive failure threshold reached")
+                        self._invalidate(
+                            "keepalive failure threshold reached",
+                            error=exc,
+                        )
                         break
         except asyncio.CancelledError:
             raise

@@ -156,6 +156,57 @@ async def test_detached_event_invalidates_the_local_handle() -> None:
         _ = plugin.id
 
 
+async def test_plugin_event_overflow_drops_oldest_without_blocking_dispatch() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    received: list[str | None] = []
+
+    async def listener(event: MediaEventResponse) -> None:
+        received.append(event.mid)
+        if event.mid == "first":
+            started.set()
+            await release.wait()
+
+    plugin = ExamplePlugin(session=FakeSession(), plugin_id=104, event_queue_size=1)
+    await plugin.on("event", listener)
+    plugin._dispatch_event(
+        MediaEventResponse(
+            janus="media",
+            sender=104,
+            type="video",
+            receiving=True,
+            mid="first",
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    plugin._dispatch_event(
+        MediaEventResponse(
+            janus="media",
+            sender=104,
+            type="video",
+            receiving=True,
+            mid="oldest-queued",
+        )
+    )
+    plugin._dispatch_event(
+        MediaEventResponse(
+            janus="media",
+            sender=104,
+            type="video",
+            receiving=True,
+            mid="newest",
+        )
+    )
+
+    assert plugin.dropped_events == 1
+    assert plugin._event_queue.qsize() == 1
+    release.set()
+    await asyncio.wait_for(plugin._event_queue.join(), timeout=1)
+
+    assert received == ["first", "newest"]
+    await plugin.aclose()
+
+
 def test_plugin_exposes_no_reactivex_compatibility_surface() -> None:
     for obsolete_name in ("rx", "subscribe_rx", "_set_rx_subject"):
         assert not hasattr(Plugin, obsolete_name)

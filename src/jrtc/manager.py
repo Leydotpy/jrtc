@@ -11,22 +11,25 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import logging
 import math
+import time
 from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
+from logvista import get_logger
+
 from jrtc.auth import JanusCredentials
 from jrtc.conf import settings
+from jrtc.core.exceptions import JanusConnectionClosed
 from jrtc.models.common import JanusId
-from jrtc.session.base import SessionState
+from jrtc.session.base import SessionLoss, SessionLossHandler, SessionState
 from jrtc.session.websocket import WebsocketSession
 
 if TYPE_CHECKING:
     from jrtc.messaging import JanusEventPublisher
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 SessionFactory = Callable[[], WebsocketSession]
 
@@ -63,8 +66,27 @@ class JanusSessionManager:
         self._lock = asyncio.Lock()
         self._monitor_task: asyncio.Task[None] | None = None
         self._replacement_tasks: dict[int, asyncio.Task[None]] = {}
-        self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._replacement_generations: dict[int, int] = {}
+        self._slot_generations: list[int] = []
+        self._loss_handlers: dict[WebsocketSession, SessionLossHandler] = {}
+        # Exactly one stale-session cleanup may exist for each bounded pool
+        # slot; a replacement does not finish until its slot cleanup does.
+        self._cleanup_tasks: dict[int, asyncio.Task[None]] = {}
         self._stopping = asyncio.Event()
+        self._metrics: dict[str, int | float] = {
+            "loss_notifications": 0,
+            "recovery_signals_deduplicated": 0,
+            "recoveries_started": 0,
+            "recovery_attempts": 0,
+            "recoveries_completed": 0,
+            "recovery_failures": 0,
+            "recovery_duration_ms_total": 0.0,
+            "last_recovery_duration_ms": 0.0,
+            "event_loop_lag_samples": 0,
+            "event_loop_lag_ms_total": 0.0,
+            "event_loop_lag_ms_last": 0.0,
+            "event_loop_lag_ms_max": 0.0,
+        }
 
     def _default_session_factory(self) -> WebsocketSession:
         token = settings.JANUS_TOKEN
@@ -88,6 +110,18 @@ class JanusSessionManager:
         return tuple(self._sessions)
 
     @property
+    def metrics(self) -> dict[str, int | float]:
+        """Return a low-overhead snapshot of pool recovery metrics."""
+
+        snapshot = dict(self._metrics)
+        samples = int(snapshot["event_loop_lag_samples"])
+        snapshot["event_loop_lag_ms_average"] = (
+            float(snapshot["event_loop_lag_ms_total"]) / samples if samples else 0.0
+        )
+        snapshot["recoveries_in_progress"] = len(self._replacement_tasks)
+        return snapshot
+
+    @property
     def ready(self) -> bool:
         return len(self._sessions) == self._pool_size and all(item.ready for item in self._sessions)
 
@@ -99,6 +133,88 @@ class JanusSessionManager:
             return active[hash(str(key)) % len(active)]
         return active[next(self._round_robin) % len(active)]
 
+    def _bind_session(
+        self,
+        index: int,
+        session: WebsocketSession,
+        slot_generation: int,
+    ) -> None:
+        """Give this manager sole recovery ownership for one pool slot."""
+
+        handler = partial(
+            self._session_lost,
+            index,
+            session,
+            slot_generation,
+        )
+        session.set_loss_handler(handler)
+        self._loss_handlers[session] = handler
+
+    def _unbind_session(self, session: WebsocketSession) -> None:
+        handler = self._loss_handlers.pop(session, None)
+        if handler is not None:
+            session.remove_loss_handler(handler)
+
+    def _session_lost(
+        self,
+        index: int,
+        session: WebsocketSession,
+        slot_generation: int,
+        loss: SessionLoss,
+    ) -> None:
+        """Synchronously turn a transport/session notification into one task."""
+
+        self._metrics["loss_notifications"] += 1
+        self._request_recovery(
+            index,
+            session,
+            slot_generation,
+            session_generation=loss.generation,
+            started_monotonic=loss.occurred_monotonic,
+        )
+
+    def _request_recovery(
+        self,
+        index: int,
+        stale: WebsocketSession,
+        slot_generation: int,
+        *,
+        session_generation: int | None = None,
+        started_monotonic: float | None = None,
+    ) -> bool:
+        """Schedule at most one recovery task for an exact slot generation."""
+
+        valid_owner = (
+            not self._stopping.is_set()
+            and self._monitor_task is not None
+            and index < len(self._sessions)
+            and index < len(self._slot_generations)
+            and self._sessions[index] is stale
+            and self._slot_generations[index] == slot_generation
+            and (session_generation is None or session_generation == stale.generation)
+        )
+        current = self._replacement_tasks.get(index)
+        if not valid_owner or current is not None:
+            self._metrics["recovery_signals_deduplicated"] += 1
+            return False
+
+        self._metrics["recoveries_started"] += 1
+        task = asyncio.create_task(
+            self._replace(
+                index,
+                stale,
+                slot_generation,
+                started_monotonic=(
+                    time.monotonic() if started_monotonic is None else started_monotonic
+                ),
+            ),
+            name=f"janus-session-replacement-{index}-{slot_generation}",
+        )
+        self._replacement_tasks[index] = task
+        self._replacement_generations[index] = slot_generation
+        task.add_done_callback(partial(self._replacement_done, index, slot_generation))
+        return True
+
     async def start(self) -> None:
         async with self._lock:
             if self._monitor_task is not None:
@@ -106,13 +222,17 @@ class JanusSessionManager:
             self._stopping.clear()
             created: list[WebsocketSession] = []
             try:
-                for _ in range(self._pool_size):
-                    created.append(self._factory())
+                for index in range(self._pool_size):
+                    session = self._factory()
+                    self._bind_session(index, session, 1)
+                    created.append(session)
                 results = await asyncio.gather(
                     *(session.create() for session in created),
                     return_exceptions=True,
                 )
             except BaseException:
+                for session in created:
+                    self._unbind_session(session)
                 await asyncio.gather(
                     *(session.destroy() for session in created),
                     return_exceptions=True,
@@ -130,6 +250,8 @@ class JanusSessionManager:
                     return_exceptions=True,
                 )
             if failures and self._fail_fast:
+                for session in created:
+                    self._unbind_session(session)
                 await asyncio.gather(
                     *(session.destroy() for session in created), return_exceptions=True
                 )
@@ -138,14 +260,23 @@ class JanusSessionManager:
                 ) from failures[0]
             if failures:
                 logger.error(
-                    "Started Janus session manager in degraded mode: %d/%d sessions failed",
-                    len(failures),
-                    self._pool_size,
+                    "Janus session pool degraded",
+                    "Some initial Janus sessions could not be activated",
+                    context={
+                        "failed_sessions": len(failures),
+                        "pool_size": self._pool_size,
+                    },
                 )
             self._sessions = created
+            self._slot_generations = [1] * len(created)
             self._monitor_task = asyncio.create_task(
                 self._monitor(), name="janus-session-pool-monitor"
             )
+            # Degraded-start failures are handed to the same single recovery
+            # owner immediately; the monitor remains only a safety net.
+            for index, session in enumerate(created):
+                if not session.ready:
+                    self._request_recovery(index, session, 1)
 
     async def stop(self) -> None:
         async with self._lock:
@@ -160,6 +291,10 @@ class JanusSessionManager:
             for replacement in replacements:
                 replacement.cancel()
             sessions, self._sessions = tuple(self._sessions), []
+            self._replacement_generations.clear()
+            self._slot_generations.clear()
+            for session in tuple(self._loss_handlers):
+                self._unbind_session(session)
         # Never wait for a task while holding the manager lock: replacement
         # tasks acquire it to commit or relinquish ownership.
         tasks = tuple(
@@ -169,7 +304,7 @@ class JanusSessionManager:
         )
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        cleanup_tasks = tuple(self._cleanup_tasks)
+        cleanup_tasks = tuple(self._cleanup_tasks.values())
         if cleanup_tasks:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
             self._cleanup_tasks.clear()
@@ -179,94 +314,196 @@ class JanusSessionManager:
             )
 
     async def _monitor(self) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._monitor_interval
         try:
             while not self._stopping.is_set():
-                await asyncio.sleep(self._monitor_interval)
+                await asyncio.sleep(max(0.0, deadline - loop.time()))
+                observed = loop.time()
+                lag_ms = max(0.0, (observed - deadline) * 1000)
+                self._metrics["event_loop_lag_samples"] += 1
+                self._metrics["event_loop_lag_ms_total"] += lag_ms
+                self._metrics["event_loop_lag_ms_last"] = lag_ms
+                self._metrics["event_loop_lag_ms_max"] = max(
+                    float(self._metrics["event_loop_lag_ms_max"]), lag_ms
+                )
+                deadline = observed + self._monitor_interval
                 for index, session in enumerate(tuple(self._sessions)):
+                    if session.ready:
+                        continue
                     if session.state not in {SessionState.LOST, SessionState.CLOSED}:
-                        continue
-                    current = self._replacement_tasks.get(index)
-                    if current is not None and not current.done():
-                        continue
-                    task = asyncio.create_task(
-                        self._replace(index, session),
-                        name=f"janus-session-replacement-{index}",
-                    )
-                    self._replacement_tasks[index] = task
-                    task.add_done_callback(partial(self._replacement_done, index))
+                        session._invalidate("manager health sweep detected an unready session")
+                    if index < len(self._slot_generations):
+                        self._request_recovery(
+                            index,
+                            session,
+                            self._slot_generations[index],
+                        )
         except asyncio.CancelledError:
             raise
 
-    def _replacement_done(self, index: int, task: asyncio.Task[None]) -> None:
+    def _replacement_done(
+        self,
+        index: int,
+        slot_generation: int,
+        task: asyncio.Task[None],
+    ) -> None:
         if self._replacement_tasks.get(index) is task:
             self._replacement_tasks.pop(index, None)
+        if self._replacement_generations.get(index) == slot_generation:
+            self._replacement_generations.pop(index, None)
         if task.cancelled():
             return
         error = task.exception()
         if error is not None:
             logger.error(
-                "Unexpected failure replacing Janus session %d",
-                index,
-                exc_info=(type(error), error, error.__traceback__),
+                "Janus recovery task failed",
+                "A session replacement task terminated unexpectedly",
+                context={
+                    "error_type": type(error).__name__,
+                    "pool_index": index,
+                    "recovery_generation": slot_generation,
+                },
+                exc_info=error,
             )
+        # A freshly committed replacement can itself be lost while the prior
+        # generation is still cleaning up. Re-check here so that deduplicating
+        # its notification cannot strand the slot until the next health sweep.
+        if (
+            not self._stopping.is_set()
+            and self._monitor_task is not None
+            and index < len(self._sessions)
+            and index < len(self._slot_generations)
+        ):
+            current = self._sessions[index]
+            if not current.ready:
+                self._request_recovery(
+                    index,
+                    current,
+                    self._slot_generations[index],
+                )
 
-    def _track_cleanup(self, session: WebsocketSession, *, name: str) -> asyncio.Task[None]:
+    def _track_cleanup(
+        self,
+        index: int,
+        session: WebsocketSession,
+        *,
+        name: str,
+    ) -> asyncio.Task[None]:
+        existing = self._cleanup_tasks.get(index)
+        if existing is not None and not existing.done():
+            raise RuntimeError(f"cleanup already active for Janus pool slot {index}")
+
         async def cleanup() -> None:
             await session.destroy()
 
         task = asyncio.create_task(cleanup(), name=name)
-        self._cleanup_tasks.add(task)
-        task.add_done_callback(self._cleanup_done)
+        self._cleanup_tasks[index] = task
+        task.add_done_callback(partial(self._cleanup_done, index))
         return task
 
-    def _cleanup_done(self, task: asyncio.Task[None]) -> None:
-        self._cleanup_tasks.discard(task)
+    def _cleanup_done(self, index: int, task: asyncio.Task[None]) -> None:
+        if self._cleanup_tasks.get(index) is task:
+            self._cleanup_tasks.pop(index, None)
         if task.cancelled():
             return
         error = task.exception()
         if error is not None:
             logger.warning(
+                "Janus session cleanup failed",
                 "Could not fully clean up a replaced Janus session",
                 exc_info=(type(error), error, error.__traceback__),
             )
 
-    async def _replace(self, index: int, stale: WebsocketSession) -> None:
+    async def _replace(
+        self,
+        index: int,
+        stale: WebsocketSession,
+        slot_generation: int,
+        *,
+        started_monotonic: float,
+    ) -> None:
         delay = self._restart_backoff
         while not self._stopping.is_set():
             replacement: WebsocketSession | None = None
             committed = False
             try:
+                if (
+                    index >= len(self._sessions)
+                    or index >= len(self._slot_generations)
+                    or self._sessions[index] is not stale
+                    or self._slot_generations[index] != slot_generation
+                ):
+                    return
+                self._metrics["recovery_attempts"] += 1
                 replacement = self._factory()
+                next_generation = slot_generation + 1
+                self._bind_session(index, replacement, next_generation)
                 await replacement.create()
+                if not replacement.ready:
+                    raise JanusConnectionClosed(
+                        "replacement session became unavailable during activation"
+                    )
                 async with self._lock:
                     if (
                         not self._stopping.is_set()
                         and index < len(self._sessions)
+                        and index < len(self._slot_generations)
                         and self._sessions[index] is stale
+                        and self._slot_generations[index] == slot_generation
+                        and replacement.ready
                     ):
+                        self._unbind_session(stale)
                         self._sessions[index] = replacement
+                        self._slot_generations[index] = next_generation
                         committed = True
                 if not committed:
                     return
 
+                duration_ms = max(
+                    0.0,
+                    (time.monotonic() - started_monotonic) * 1000,
+                )
+                self._metrics["recoveries_completed"] += 1
+                self._metrics["recovery_duration_ms_total"] += duration_ms
+                self._metrics["last_recovery_duration_ms"] = duration_ms
+
                 stale_cleanup = self._track_cleanup(
+                    index,
                     stale,
-                    name=f"janus-stale-session-cleanup-{index}",
+                    name=(f"janus-stale-session-cleanup-{index}-{slot_generation}"),
                 )
                 # Keep cleanup alive if this replacement task is cancelled
                 # concurrently with manager shutdown.
                 await asyncio.gather(asyncio.shield(stale_cleanup), return_exceptions=True)
-                logger.info("Replaced lost Janus session at pool index %d", index)
+                logger.info(
+                    "Janus session recovered",
+                    "Replaced one unavailable session pool slot",
+                    context={
+                        "duration_ms": round(duration_ms, 3),
+                        "pool_index": index,
+                        "recovery_generation": slot_generation,
+                    },
+                )
                 return
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception(
-                    "Could not replace lost Janus session; retrying in %.1fs",
-                    delay,
+            except Exception as exc:
+                self._metrics["recovery_failures"] += 1
+                logger.error(
+                    "Janus recovery attempt failed",
+                    "Could not activate a replacement session; retrying",
+                    context={
+                        "backoff_seconds": delay,
+                        "error_type": type(exc).__name__,
+                        "pool_index": index,
+                        "recovery_generation": slot_generation,
+                    },
+                    exc_info=exc,
                 )
             finally:
                 if replacement is not None and not committed:
+                    self._unbind_session(replacement)
                     cleanup = asyncio.create_task(replacement.destroy())
                     try:
                         await asyncio.shield(cleanup)
@@ -275,6 +512,7 @@ class JanusSessionManager:
                         raise
                     except Exception:
                         logger.warning(
+                            "Janus replacement cleanup failed",
                             "Could not clean up an uncommitted Janus replacement",
                             exc_info=True,
                         )

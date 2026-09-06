@@ -48,7 +48,7 @@ class JanusRequestTimeout(JanusTransportError, TimeoutError):
             context={
                 "transaction": transaction,
                 "timeout": timeout,
-            }
+            },
         )
 
 
@@ -67,18 +67,15 @@ class JanusErrorResponse(JanusException):
         self.reason = reason
         self.transaction = transaction
         self.response = response
-        title = f"Janus error {code}: {reason}"
-        message = f"Janus error {code!r} returned {reason!r}"
-        super().__init__(title)
+        exception_message = f"Janus error {code}: {reason}"
+        super().__init__(exception_message)
         logger.error(
-            title,
-            message=message,
+            "Janus error response",
+            message="The gateway returned a Janus protocol error",
             context={
                 "code": code,
-                "reason": reason,
                 "transaction": transaction,
-                "response": response,
-            }
+            },
         )
 
 

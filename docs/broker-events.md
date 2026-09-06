@@ -21,9 +21,10 @@ The short version is:
 Janus Gateway
     -> validate one response
     -> JanusResponseDispatcher (Dispio)
-       -> ACK/error/transaction resolution
-       -> local session and plugin listeners
-       -> bounded JanusEventPublisher admission, for supported events only
+       -> ACK/error/transaction resolution first
+       -> non-blocking local session/plugin queue admission
+       -> non-waiting JanusEventPublisher.try_admit, for supported events only
+    -> fixed publisher workers serialize and call Broka
     -> Broka logical route (janus.event, janus.media, ...)
     -> Broka Router maps janus.* to the exact physical destination janus.events
     -> Redis, RabbitMQ, Kafka, or an in-process engine
@@ -477,8 +478,10 @@ durable failure workflow explicitly for Redis and Kafka.
 ## Producer lifecycle and backpressure
 
 `JanusEventPublisher` decouples a transport receive loop from backend latency. Its
-defaults are four workers, a global capacity of 1,024 admitted events, and a
-50-millisecond admission timeout.
+defaults are four workers and a global capacity of 1,024 admitted events.
+Transports call synchronous `try_admit()`, which never waits for capacity and does
+not build the broker payload. The 50-millisecond admission timeout applies only to
+the awaited compatibility `admit()` method for non-hot-path callers.
 
 ```python
 from jrtc.messaging import JanusEventPublisher, create_broker
@@ -505,14 +508,21 @@ finally:
 
 Accepted events are assigned to a deterministic worker shard by
 `session_id:sender`, preserving per-key publish order within one publisher
-process. Different keys publish concurrently. Backend failure is isolated from
-the Janus receive loop. After Broka exhausts its publish retry policy, however,
-the publisher records a failure and releases the item; its queue is not a durable
-outbox.
+process. Different keys publish concurrently. A lightweight ingress envelope holds
+the typed response reference; Pydantic JSON normalization happens only after a
+worker takes it. Backend failure is isolated from the Janus receive loop. JRTC
+retries at most `max_publish_retries` times (zero by default), with a finite timeout
+per attempt and bounded exponential backoff. After those attempts and Broka's own
+policy are exhausted, the publisher records a failure and releases the item; its
+queue is not a durable outbox.
 
-Capacity protects the Janus receive loop from unbounded memory growth. Admission
-timeout, shutdown cancellation, and a full/rejecting backend are observable drops.
-Size capacity from measured peak event rate and backend latency. Graceful shutdown
+Capacity protects the Janus receive loop from unbounded memory growth. Normal
+events use drop-newest. Generic `media` and `slowlink` telemetry is coalescible by
+session/handle/state key with latest-state-wins. Protected `timeout`, `detached`,
+and `hangup` events can evict the oldest queued non-protected event, but are rejected
+when every slot is already in flight or protected. Applications can replace the
+generic classifier without placing domain logic in JRTC. Every accept, reject,
+coalesce, eviction, retry, and worker failure is accounted. Graceful shutdown
 should stop transport admission first, drain the publisher, and shut down the
 broker last.
 
@@ -525,17 +535,20 @@ not assume identical throughput or concurrency behavior.
 
 `create_broker()` installs `LogVistaMetrics` by default. It keeps an in-memory
 snapshot and writes every counter, gauge, and observation update as a structured
-LogVista debug diagnostic. Payloads, plugin data, JSEP, session IDs, handle IDs,
-transactions, and other high-cardinality identifiers are not metric labels or log
-fields.
+LogVista debug diagnostic. Payloads, plugin data, JSEP/SDP, ICE candidate strings,
+and credentials are never routine log fields. Session IDs, handle IDs, transaction
+IDs, generations, durations, and queue depths may appear as structured diagnostic
+metadata, but high-cardinality identifiers are not metric labels.
 
 The Janus-specific metrics are:
 
 | Metric | Type | Purpose |
 | --- | --- | --- |
-| `janus_event_admission_total` | counter | Accepted, timed-out, or invalid publisher admission |
+| `janus_event_admission_total` | counter | Accepted, full, timed-out, coalesced, or invalid admission |
+| `janus_event_coalesced_total` | counter | Latest-state replacements of queued telemetry |
 | `janus_event_published_total` | counter | Backend-accepted events |
 | `janus_event_publish_failures_total` | counter | Rejected, failed, or shutdown publication |
+| `janus_event_publish_retries_total` | counter | Bounded worker retry attempts |
 | `janus_event_dropped_total` | counter | Unsupported, stopped, timed-out, cancelled, or discarded events |
 | `janus_event_queue_depth` | gauge | Admitted events not yet completed |
 | `janus_event_queue_latency_seconds` | histogram | Admission-to-worker delay |
@@ -544,6 +557,9 @@ The Janus-specific metrics are:
 | `janus_dispatch_failures_total` | counter | Selected handler/callback failures |
 | `janus_dispatch_duration_seconds` | histogram | Dispio dispatch duration |
 | `janus_listener_failures_total` | counter | Isolated local listener failures |
+| `janus_listener_dropped_total` | counter | Full or closed local-listener queue admission |
+| `janus_listener_queue_depth` | gauge | Pending bounded local-listener notifications |
+| `janus_listener_queue_latency_seconds` | histogram | Local listener admission-to-worker delay |
 
 Broka also records its own `pyev_*` publish, consume, retry, handler, ACK/NACK,
 in-flight, and latency series through the same provider.
@@ -710,7 +726,7 @@ There is no Reactivex compatibility layer in the new design.
 
 | Previous concept | Current equivalent |
 | --- | --- |
-| `Subject.on_next(response)` | `await JanusEventPublisher.admit(response, ...)` |
+| `Subject.on_next(response)` | Non-hot callers: `await publisher.admit(...)`; transports: `publisher.try_admit(...)` |
 | `Observable.subscribe(on_next=...)` | `await broker.subscribe("janus.events", async_handler)` |
 | Disposable subscription | `await subscription.close()` |
 | Rx filtering by event enum | Dispio exact/glob/type matchers keyed by `delivery.envelope.type` |

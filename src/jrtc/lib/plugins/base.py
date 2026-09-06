@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, ClassVar, Literal, Self, TypedDict, cast, get_origin
 
 from pydantic import BaseModel
@@ -30,6 +31,20 @@ from jrtc.models.request import (
 logger = logging.getLogger(__name__)
 
 Listener = Callable[[Any], Awaitable[Any] | Any]
+
+
+@dataclass(slots=True)
+class _QueuedEmission:
+    """One local ``emit`` call admitted to the per-handle worker.
+
+    Futures preserve the useful part of the historical fire-and-forget API
+    without creating one task per callback.  The containing queue is bounded,
+    and the single per-handle worker invokes callbacks sequentially.
+    """
+
+    callbacks: tuple[Listener, ...]
+    payload: Any
+    outcomes: tuple[asyncio.Future[Any], ...]
 
 
 class PluginOptions(TypedDict, total=False):
@@ -115,13 +130,13 @@ class Plugin:
             None if plugin_id is None else validate_janus_id(plugin_id, name="plugin_id")
         )
         self._listeners: dict[str, list[Listener]] = {}
-        self._tasks: set[asyncio.Task[Any]] = set()
         self._lifecycle_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
         self._event_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=event_queue_size)
         self._event_task: asyncio.Task[None] | None = None
         self._dropped_events = 0
         self._closed = False
+        self._handle_lost = False
         self._on_event = on_event
 
     @classmethod
@@ -166,37 +181,61 @@ class Plugin:
         wait: bool = False,
         timeout: float | None = None,
     ) -> list[Any]:
+        """Invoke listeners without creating an unbounded task fan-out.
+
+        Awaited emissions and transport events normally share the one bounded
+        per-handle worker.  ``wait=False`` remains fire-and-forget and returns
+        Future-compatible outcome handles, but no callback gets its own Task.
+        A listener recursively using ``wait=True`` is run inline to avoid a
+        worker waiting on itself.
+        """
+
         callbacks = tuple(self._listeners.get(event, ()))
-        tasks = [self._schedule_listener(callback, payload) for callback in callbacks]
-        if not wait or not tasks:
-            return tasks
-        done, pending = await asyncio.wait(tasks, timeout=timeout)
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
-        return [task.result() for task in done if not task.cancelled() and task.exception() is None]
+        if not callbacks or self._closed or self._handle_lost:
+            return []
+
+        if wait and asyncio.current_task() is self._event_task:
+            return await self._invoke_listener_batch(callbacks, payload, timeout=timeout)
+
+        loop = asyncio.get_running_loop()
+        outcomes = tuple(loop.create_future() for _ in callbacks)
+        for outcome in outcomes:
+            outcome.add_done_callback(self._listener_outcome_done)
+        emission = _QueuedEmission(callbacks=callbacks, payload=payload, outcomes=outcomes)
+        if not self._admit_local_event(emission):
+            self._cancel_queue_item(emission)
+            return []
+        if not wait:
+            return list(outcomes)
+
+        try:
+            done, pending = await asyncio.wait(outcomes, timeout=timeout)
+        except BaseException:
+            for outcome in outcomes:
+                outcome.cancel()
+            raise
+        for outcome in pending:
+            outcome.cancel()
+        return [
+            outcome.result()
+            for outcome in outcomes
+            if outcome in done and not outcome.cancelled() and outcome.exception() is None
+        ]
 
     @staticmethod
     async def _invoke_listener(callback: Listener, payload: Any) -> Any:
-        if inspect.iscoroutinefunction(callback):
-            return await callback(payload)
-        result = await asyncio.to_thread(callback, payload)
+        # Synchronous listeners remain source-compatible, but run in the
+        # plugin worker and therefore must be quick.  JRTC never creates a
+        # thread bridge inside its async control plane.
+        result = callback(payload)
         if inspect.isawaitable(result):
             return await result
         return result
 
-    def _schedule_listener(self, callback: Listener, payload: Any) -> asyncio.Task[Any]:
-        task = asyncio.create_task(self._invoke_listener(callback, payload))
-        self._tasks.add(task)
-        task.add_done_callback(self._listener_done)
-        return task
-
-    def _listener_done(self, task: asyncio.Task[Any]) -> None:
-        self._tasks.discard(task)
-        if task.cancelled():
+    def _listener_outcome_done(self, outcome: asyncio.Future[Any]) -> None:
+        if outcome.cancelled():
             return
-        error = task.exception()
+        error = outcome.exception()
         if error is not None:
             logger.error(
                 "Plugin event callback failed for handle %s",
@@ -204,11 +243,55 @@ class Plugin:
                 exc_info=(type(error), error, error.__traceback__),
             )
 
+    async def _invoke_listener_batch(
+        self,
+        callbacks: tuple[Listener, ...],
+        payload: Any,
+        *,
+        timeout: float | None,
+    ) -> list[Any]:
+        """Run a stable callback snapshot sequentially with one deadline."""
+
+        results: list[Any] = []
+        deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+        for callback in callbacks:
+            if deadline is not None and deadline <= asyncio.get_running_loop().time():
+                break
+            try:
+                if deadline is None:
+                    result = await self._invoke_listener(callback, payload)
+                else:
+                    async with asyncio.timeout_at(deadline):
+                        result = await self._invoke_listener(callback, payload)
+            except TimeoutError:
+                break
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+                logger.warning(
+                    "Plugin event callback cancelled itself for handle %s",
+                    self._plugin_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Plugin event callback failed for handle %s",
+                    self._plugin_id,
+                )
+            else:
+                results.append(result)
+        return results
+
     def _dispatch_event(self, event: Any) -> None:
         """Route one event to this handle without blocking the transport loop."""
 
-        if self._closed:
-            return
+        self._admit_local_event(event)
+
+    def _admit_local_event(self, event: Any) -> bool:
+        """Admit one local event immediately using oldest-event eviction."""
+
+        if self._closed or self._handle_lost:
+            return False
         if self._event_task is None or self._event_task.done():
             self._event_task = asyncio.create_task(
                 self._event_loop(),
@@ -220,54 +303,100 @@ class Plugin:
             # Keep the newest state under overload and expose the loss.
             self._dropped_events += 1
             try:
-                self._event_queue.get_nowait()
+                dropped = self._event_queue.get_nowait()
                 self._event_queue.task_done()
             except asyncio.QueueEmpty:
                 pass
+            else:
+                self._cancel_queue_item(dropped)
             self._event_queue.put_nowait(event)
-            logger.error(
-                "Plugin handle %s event queue overflow; dropped=%d",
-                self._plugin_id,
-                self._dropped_events,
-            )
+            # Overload accounting is exact; diagnostics are exponentially
+            # sampled so a hot reader is not turned into a logging loop.
+            if self._dropped_events & (self._dropped_events - 1) == 0:
+                logger.warning(
+                    "Plugin handle %s event queue overflow; dropped=%d",
+                    self._plugin_id,
+                    self._dropped_events,
+                )
+        return True
 
     async def _event_loop(self) -> None:
-        while not self._closed:
+        while True:
             event = await self._event_queue.get()
             try:
-                callbacks = list(self._listeners.get("event", ()))
-                janus_type = getattr(event, "janus", None)
-                if isinstance(janus_type, str):
-                    for callback in self._listeners.get(janus_type, ()):
-                        if callback not in callbacks:
-                            callbacks.append(callback)
-                if self._on_event is not None and self._on_event not in callbacks:
-                    callbacks.append(self._on_event)
-                # Run callbacks in order inside the per-handle worker. This is
-                # deliberate backpressure: callback storms cannot create an
-                # unbounded task set, and a callback may safely close its own
-                # plugin without a task-await cycle.
-                for callback in callbacks:
-                    try:
-                        await self._invoke_listener(callback, event)
-                    except asyncio.CancelledError:
-                        task = asyncio.current_task()
-                        if task is not None and task.cancelling():
-                            raise
-                        logger.warning(
-                            "Plugin event callback cancelled itself for handle %s",
-                            self._plugin_id,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Plugin event callback failed for handle %s",
-                            self._plugin_id,
-                        )
-                if janus_type == "detached":
-                    await self._invalidate_handle()
-                    return
+                if isinstance(event, _QueuedEmission):
+                    await self._deliver_queued_emission(event)
+                else:
+                    await self._deliver_janus_event(event)
+            except asyncio.CancelledError:
+                self._cancel_queue_item(event)
+                raise
             finally:
                 self._event_queue.task_done()
+            if self._closed or self._handle_lost:
+                return
+
+    async def _deliver_queued_emission(self, emission: _QueuedEmission) -> None:
+        for index, (callback, outcome) in enumerate(
+            zip(emission.callbacks, emission.outcomes, strict=True)
+        ):
+            if self._closed or self._handle_lost:
+                for remaining in emission.outcomes[index:]:
+                    remaining.cancel()
+                return
+            if outcome.cancelled():
+                continue
+            try:
+                result = await self._invoke_listener(callback, emission.payload)
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    for remaining in emission.outcomes[index:]:
+                        remaining.cancel()
+                    raise
+                outcome.cancel()
+                logger.warning(
+                    "Plugin event callback cancelled itself for handle %s",
+                    self._plugin_id,
+                )
+            except Exception as error:
+                if not outcome.done():
+                    outcome.set_exception(error)
+            else:
+                if not outcome.done():
+                    outcome.set_result(result)
+
+    async def _deliver_janus_event(self, event: Any) -> None:
+        callbacks = list(self._listeners.get("event", ()))
+        janus_type = getattr(event, "janus", None)
+        if isinstance(janus_type, str):
+            for callback in self._listeners.get(janus_type, ()):
+                if callback not in callbacks:
+                    callbacks.append(callback)
+        if self._on_event is not None and self._on_event not in callbacks:
+            callbacks.append(self._on_event)
+        # Callbacks remain ordered inside the one per-handle worker.  Slow
+        # application code can delay this handle, but never the transport.
+        await self._invoke_listener_batch(tuple(callbacks), event, timeout=None)
+        if janus_type == "detached":
+            await self._invalidate_handle()
+
+    @staticmethod
+    def _cancel_queue_item(event: Any) -> None:
+        if isinstance(event, _QueuedEmission):
+            for outcome in event.outcomes:
+                outcome.cancel()
+
+    def _discard_pending_events(self) -> None:
+        """Drop queued work and settle its outcome futures during shutdown."""
+
+        while True:
+            try:
+                event = self._event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self._cancel_queue_item(event)
+            self._event_queue.task_done()
 
     @property
     def dropped_events(self) -> int:
@@ -284,12 +413,28 @@ class Plugin:
         return None
 
     def stop(self) -> None:
-        for task in tuple(self._tasks):
-            task.cancel()
+        event_task = self._event_task
+        if event_task is not None and event_task is not asyncio.current_task():
+            event_task.cancel()
+        self._discard_pending_events()
+
+    def _mark_handle_lost(self) -> None:
+        """Synchronously fence a handle whose owning session was lost.
+
+        Session recovery needs the public handle ID to become unusable before
+        it schedules asynchronous cleanup.  Repeated loss notifications are
+        harmless; :meth:`_invalidate_handle`/``aclose`` finish cleanup later.
+        """
+
+        if self._handle_lost:
+            return
+        self._handle_lost = True
+        self._plugin_id = None
+        self.stop()
 
     async def attach(self, *, opaque_id: str | None = None) -> Self:
         async with self._lifecycle_lock:
-            if self._closed:
+            if self._closed or self._handle_lost:
                 raise RuntimeError("closed plugin handles cannot be attached")
             if self._plugin_id is not None:
                 registered = self.session.plugins.get(self.id)
@@ -417,13 +562,7 @@ class Plugin:
             if event_task is not None and event_task is not current:
                 event_task.cancel()
                 await asyncio.gather(event_task, return_exceptions=True)
-            tasks = tuple(task for task in self._tasks if task is not current)
-            for task in tasks:
-                task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            if current is not None:
-                self._tasks.discard(current)
+            self._discard_pending_events()
             self._listeners.clear()
 
     async def _aclose(self) -> None:
@@ -436,6 +575,7 @@ class Plugin:
 
         async with self._lifecycle_lock:
             handle_id, self._plugin_id = self._plugin_id, None
+            self._handle_lost = True
             if handle_id is not None and self.session.plugins.get(handle_id) is self:
                 self.session.plugins.unregister(handle_id)
         await self.aclose()

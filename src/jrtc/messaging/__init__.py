@@ -2,6 +2,7 @@
 
 from jrtc.messaging.constants import (
     ADMISSION_TOTAL,
+    COALESCED_TOTAL,
     DEFAULT_PHYSICAL_ROUTE,
     DISPATCH_DURATION_SECONDS,
     DISPATCH_FAILURES_TOTAL,
@@ -10,9 +11,13 @@ from jrtc.messaging.constants import (
     DROPPED_TOTAL,
     JANUS_EVENT_ROUTES,
     JANUS_LOGICAL_PATTERN,
+    LISTENER_DROPPED_TOTAL,
     LISTENER_FAILURES_TOTAL,
+    LISTENER_QUEUE_DEPTH,
+    LISTENER_QUEUE_LATENCY_SECONDS,
     PUBLISH_FAILURES_TOTAL,
     PUBLISH_LATENCY_SECONDS,
+    PUBLISH_RETRIES_TOTAL,
     PUBLISHED_TOTAL,
     QUEUE_DEPTH,
     QUEUE_LATENCY_SECONDS,
@@ -26,10 +31,18 @@ from jrtc.messaging.factory import (
 )
 from jrtc.messaging.listeners import LocalListenerRegistry, ResponseCallback
 from jrtc.messaging.metrics import LogVistaMetrics
-from jrtc.messaging.publisher import JanusEventPublisher, JanusIdentifier
+from jrtc.messaging.publisher import (
+    EventClassifier,
+    EventIngressEnvelope,
+    EventPriority,
+    JanusEventPublisher,
+    JanusIdentifier,
+    default_event_classifier,
+)
 
 __all__ = [
     "ADMISSION_TOTAL",
+    "COALESCED_TOTAL",
     "DEFAULT_PHYSICAL_ROUTE",
     "DISPATCHABLE_JANUS_TYPES",
     "DISPATCH_DURATION_SECONDS",
@@ -38,13 +51,20 @@ __all__ = [
     "DROPPED_TOTAL",
     "JANUS_EVENT_ROUTES",
     "JANUS_LOGICAL_PATTERN",
+    "LISTENER_DROPPED_TOTAL",
     "LISTENER_FAILURES_TOTAL",
+    "LISTENER_QUEUE_DEPTH",
+    "LISTENER_QUEUE_LATENCY_SECONDS",
     "PUBLISHED_TOTAL",
     "PUBLISH_FAILURES_TOTAL",
     "PUBLISH_LATENCY_SECONDS",
+    "PUBLISH_RETRIES_TOTAL",
     "QUEUE_DEPTH",
     "QUEUE_LATENCY_SECONDS",
     "BrokerEngine",
+    "EventClassifier",
+    "EventIngressEnvelope",
+    "EventPriority",
     "JanusEventPublisher",
     "JanusIdentifier",
     "JanusResponseDispatcher",
@@ -54,4 +74,5 @@ __all__ = [
     "configured_engine",
     "create_broker",
     "create_engine_registry",
+    "default_event_classifier",
 ]

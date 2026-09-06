@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from jrtc.models.base import Jsep
 from jrtc.models.common import JanusId
+
+MAX_TRICKLE_CANDIDATES: Final = 256
 
 
 def _transaction_id() -> str:
@@ -85,12 +87,30 @@ class TrickleCandidate(BaseModel):
     nesting it under a second ``candidate`` key is a protocol error.
     """
 
-    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+        validate_assignment=True,
+    )
 
-    candidate: str | None = Field(default=None, min_length=1)
+    candidate: str | None = Field(default=None, strict=True, min_length=1)
     completed: Literal[True] | None = None
-    sdp_mid: str | None = Field(default=None, alias="sdpMid", min_length=1)
-    sdp_mline_index: int | None = Field(default=None, alias="sdpMLineIndex", ge=0)
+    sdp_mid: str | None = Field(default=None, alias="sdpMid", strict=True, min_length=1)
+    sdp_mline_index: int | None = Field(
+        default=None,
+        alias="sdpMLineIndex",
+        strict=True,
+        ge=0,
+    )
+
+    @field_validator("completed", mode="before")
+    @classmethod
+    def _validate_completed_type(cls, value: Any) -> Any:
+        # Pydantic otherwise accepts the integer ``1`` for ``Literal[True]``.
+        # The Janus completion marker is a JSON boolean, not a truthy sentinel.
+        if value is not None and value is not True:
+            raise ValueError("completed must be the boolean true")
+        return value
 
     @model_validator(mode="after")
     def _validate_shape(self) -> TrickleCandidate:
@@ -106,14 +126,16 @@ class TrickleCandidate(BaseModel):
 class TrickleRequest(BaseJanusRequest):
     janus: Literal["trickle"] = "trickle"
     candidate: TrickleCandidate | None = None
-    candidates: list[TrickleCandidate] | None = Field(default=None, max_length=256)
+    candidates: list[TrickleCandidate] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=MAX_TRICKLE_CANDIDATES,
+    )
 
     @model_validator(mode="after")
     def _validate_candidate_container(self) -> TrickleRequest:
         if (self.candidate is None) == (self.candidates is None):
             raise ValueError("provide exactly one of candidate or candidates")
-        if self.candidates is not None and not self.candidates:
-            raise ValueError("candidates cannot be empty")
         return self
 
 

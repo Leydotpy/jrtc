@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import enum
 import inspect
-import logging
 import math
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self
 
 from dispio import Dispatcher, ExactMatcher
+from logvista import get_logger
 
 from jrtc.auth import CredentialSource, resolve_credentials
 from jrtc.conf import settings
@@ -28,8 +30,6 @@ from jrtc.models.response import SuccessResponse
 from jrtc.transport.base import JanusTransport
 from jrtc.transport.websocket import WebsocketTransportClient
 
-from logvista import get_logger
-
 if TYPE_CHECKING:
     from jrtc.messaging import JanusEventPublisher
 
@@ -45,6 +45,24 @@ class SessionState(enum.StrEnum):
     LOST = "lost"
     CLOSING = "closing"
     CLOSED = "closed"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionLoss:
+    """One immutable notification that a session generation became unusable.
+
+    The notification intentionally carries only lifecycle metadata.  It never
+    retains a Janus response, SDP, ICE candidate, or transport exception body.
+    """
+
+    generation: int
+    session_id: JanusId | None
+    reason: str
+    occurred_monotonic: float
+    error_type: str | None = None
+
+
+type SessionLossHandler = Callable[[SessionLoss], None]
 
 
 def _default_transport_factory(
@@ -78,6 +96,11 @@ def _default_transport_factory(
         return WebsocketTransportClient(
             url,
             request_timeout=request_timeout,
+            # Socket loss invalidates every Janus session and handle bound to
+            # that connection.  Recreating those resources belongs to the
+            # session manager; reconnecting only the socket would leave stale
+            # IDs attached to a new transport generation.
+            reconnect=False,
             event_publisher=event_publisher,
         )
 
@@ -142,7 +165,12 @@ class AbstractBaseSession:
         self._setup_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
         self._lost_session_id: JanusId | None = None
-        self._cleanup_tasks: set[asyncio.Task[Any]] = set()
+        self._generation = 0
+        self._loss_handler: SessionLossHandler | None = None
+        # Loss invalidation is idempotent and recreation waits for cleanup, so
+        # one session can own at most one generation-cleanup task.
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._metrics = {"session_losses": 0}
         self._event_dispatcher = Dispatcher(name="janus.session.events")
         self._event_dispatcher.add(
             ExactMatcher("timeout"),
@@ -179,12 +207,49 @@ class AbstractBaseSession:
         return self._lost_session_id
 
     @property
+    def generation(self) -> int:
+        """Activation-attempt generation used to fence stale loss signals."""
+
+        return self._generation
+
+    @property
+    def metrics(self) -> dict[str, int]:
+        """Return a cheap snapshot of session lifecycle counters."""
+
+        return dict(self._metrics)
+
+    @property
     def plugins(self) -> PluginManager[Any]:
         return self._plugins
 
     @property
     def transport(self) -> JanusTransport | None:
         return self._transport
+
+    def set_loss_handler(self, handler: SessionLossHandler | None) -> None:
+        """Assign the single non-blocking owner of session recovery.
+
+        A session deliberately supports one handler rather than a fan-out of
+        recovery callbacks.  This prevents two managers from independently
+        replacing the same session generation.  The handler must do constant,
+        synchronous work (normally scheduling one bounded manager task).
+        """
+
+        if handler is not None and not callable(handler):
+            raise TypeError("session loss handler must be callable")
+        if (
+            handler is not None
+            and self._loss_handler is not None
+            and self._loss_handler is not handler
+        ):
+            raise RuntimeError("session already has a recovery owner")
+        self._loss_handler = handler
+
+    def remove_loss_handler(self, handler: SessionLossHandler) -> None:
+        """Release recovery ownership if *handler* is still the owner."""
+
+        if self._loss_handler is handler:
+            self._loss_handler = None
 
     async def _setup(self) -> None:
         async with self._setup_lock:
@@ -324,38 +389,135 @@ class AbstractBaseSession:
         except Exception:
             logger.exception("Could not route event for Janus handle %s", sender)
 
-    def _transport_closed(self, _error: BaseException | None = None) -> None:
-        self._invalidate("transport connection closed")
+    def _transport_closed(self, error: BaseException | None = None) -> None:
+        self._invalidate("transport connection closed", error=error)
 
-    def _invalidate(self, reason: str) -> None:
+    def _invalidate(self, reason: str, *, error: BaseException | None = None) -> None:
+        """Synchronously fence a lost generation and notify its recovery owner."""
+
         if self._state in {SessionState.CLOSING, SessionState.CLOSED, SessionState.LOST}:
             return
         self._lost_session_id = self._session_id
         self._session_id = None
         self._state = SessionState.LOST
         plugins = tuple(self._plugins.as_dict().values())
-        self._plugins.clear()
         for plugin in plugins:
-            close = getattr(plugin, "_invalidate_handle", None)
-            if not callable(close):
-                close = getattr(plugin, "aclose", None)
-            if callable(close):
+            mark_lost = getattr(plugin, "_mark_handle_lost", None)
+            if callable(mark_lost):
                 try:
-                    task = asyncio.create_task(close())
-                except RuntimeError:
-                    logger.debug(
-                        "Handle invalidation!",
-                        "No event loop available to close invalidated plugin",
+                    result = mark_lost()
+                    if inspect.isawaitable(result):
+                        close = getattr(result, "close", None)
+                        if callable(close):
+                            close()
+                        raise TypeError("_mark_handle_lost must be synchronous")
+                except Exception as exc:
+                    # One third-party plugin must not prevent the manager from
+                    # observing the session loss and fencing every other handle.
+                    logger.warning(
+                        "Stale handle fencing failed",
+                        "A plugin rejected synchronous session-loss invalidation",
                         context={
-                            "session": self._lost_session_id,
-                            "state": self._state,
-                            "plugin": plugin,
-                        }
+                            "error_type": type(exc).__name__,
+                            "generation": self._generation,
+                            "session_id": self._lost_session_id,
+                        },
                     )
-                else:
-                    self._cleanup_tasks.add(task)
-                    task.add_done_callback(self._cleanup_tasks.discard)
-        logger.warning("Janus session invalidated: %s", reason, context={"session": self._lost_session_id})
+        self._plugins.clear()
+        self._unregister_transport_listeners()
+
+        abort_session = getattr(self._transport, "abort_session", None)
+        if self._lost_session_id is not None and callable(abort_session):
+            abort_session(
+                self._lost_session_id,
+                JanusConnectionClosed("Janus session was lost"),
+            )
+
+        self._metrics["session_losses"] += 1
+        loss = SessionLoss(
+            generation=self._generation,
+            session_id=self._lost_session_id,
+            reason=reason,
+            occurred_monotonic=time.monotonic(),
+            error_type=None if error is None else type(error).__name__,
+        )
+        handler = self._loss_handler
+        if handler is not None:
+            try:
+                handler(loss)
+            except Exception as exc:
+                logger.error(
+                    "Session recovery notification failed",
+                    "The Janus session loss handler raised",
+                    context={
+                        "error_type": type(exc).__name__,
+                        "generation": self._generation,
+                        "session_id": self._lost_session_id,
+                    },
+                    exc_info=exc,
+                )
+
+        lost_transport = self._transport
+
+        async def cleanup_lost_generation() -> None:
+            for plugin in plugins:
+                close = getattr(plugin, "_invalidate_handle", None)
+                if not callable(close):
+                    close = getattr(plugin, "aclose", None)
+                if not callable(close):
+                    continue
+                try:
+                    result = close()
+                    if inspect.isawaitable(result):
+                        await result
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Stale handle cleanup failed",
+                        "Could not close a plugin invalidated with its Janus session",
+                        context={
+                            "error_type": type(exc).__name__,
+                            "generation": loss.generation,
+                            "session_id": loss.session_id,
+                        },
+                    )
+            if self._owns_transport and lost_transport is not None:
+                try:
+                    await lost_transport.stop()
+                finally:
+                    if self._transport is lost_transport:
+                        self._transport = None
+
+        try:
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(
+                cleanup_lost_generation(),
+                name=f"janus-session-loss-cleanup-{self._generation}",
+            )
+        except RuntimeError:
+            logger.debug(
+                "Session loss cleanup deferred",
+                "No event loop is available for invalidated session cleanup",
+                context={
+                    "generation": self._generation,
+                    "session_id": self._lost_session_id,
+                },
+            )
+        else:
+            self._cleanup_task = task
+            task.add_done_callback(self._loss_cleanup_done)
+
+        logger.warning(
+            "Janus session lost",
+            "Invalidated a Janus session generation",
+            context={
+                "error_type": loss.error_type,
+                "generation": loss.generation,
+                "reason": loss.reason,
+                "session_id": loss.session_id,
+            },
+        )
 
     async def _close_local(self) -> None:
         self._unregister_transport_listeners()
@@ -366,13 +528,40 @@ class AbstractBaseSession:
                 *(plugin.aclose() for plugin in plugins if hasattr(plugin, "aclose")),
                 return_exceptions=True,
             )
-        cleanup_tasks = tuple(self._cleanup_tasks)
-        if cleanup_tasks:
-            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-            self._cleanup_tasks.clear()
+        cleanup = self._cleanup_task
+        if cleanup is not None and cleanup is not asyncio.current_task():
+            await asyncio.gather(cleanup, return_exceptions=True)
+            if self._cleanup_task is cleanup:
+                self._cleanup_task = None
         if self._owns_transport and self._transport is not None:
             await self._transport.stop()
         self._transport = None
+
+    async def _drain_cleanup_tasks(self) -> None:
+        """Wait for the bounded cleanup from a previous lost generation."""
+
+        cleanup = self._cleanup_task
+        if cleanup is not None and cleanup is not asyncio.current_task():
+            await asyncio.gather(cleanup, return_exceptions=True)
+            if self._cleanup_task is cleanup:
+                self._cleanup_task = None
+
+    def _loss_cleanup_done(self, task: asyncio.Task[None]) -> None:
+        if self._cleanup_task is task:
+            self._cleanup_task = None
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning(
+                "Session loss cleanup failed",
+                "Could not fully release a lost Janus session generation",
+                context={
+                    "error_type": type(error).__name__,
+                    "generation": self._generation,
+                    "session_id": self._lost_session_id,
+                },
+            )
 
     async def create(self) -> Self:
         raise NotImplementedError

@@ -128,6 +128,19 @@ class RecordingPublisher:
         session_id: Any = None,
         sender: Any = None,
     ) -> bool:
+        return self.try_admit(
+            response,
+            session_id=session_id,
+            sender=sender,
+        )
+
+    def try_admit(
+        self,
+        response: Any,
+        *,
+        session_id: Any = None,
+        sender: Any = None,
+    ) -> bool:
         self.calls.append((response, session_id, sender))
         return True
 

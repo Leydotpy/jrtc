@@ -9,6 +9,7 @@ import logging
 import math
 import re
 import time
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -81,6 +82,7 @@ def _transport_failure(operation: str, error: Exception) -> JanusTransportError:
 @dataclass(slots=True)
 class _Pending:
     future: asyncio.Future[JanusResponse]
+    session_id: JanusId | None
     wait_for_event: bool
 
 
@@ -95,6 +97,8 @@ class HttpTransportClient:
         poll_timeout: float = 35.0,
         max_poll_events: int = 10,
         max_pending_transactions: int = 4096,
+        max_sessions: int = 1024,
+        listener_queue_capacity: int = 1024,
         client: httpx.AsyncClient | None = None,
         event_publisher: JanusEventPublisher | None = None,
     ) -> None:
@@ -109,11 +113,20 @@ class HttpTransportClient:
             raise ValueError("max_poll_events must be between 1 and 100")
         if max_pending_transactions < 1:
             raise ValueError("max_pending_transactions must be positive")
+        if isinstance(max_sessions, bool) or not isinstance(max_sessions, int) or max_sessions < 1:
+            raise ValueError("max_sessions must be a positive integer")
+        if (
+            isinstance(listener_queue_capacity, bool)
+            or not isinstance(listener_queue_capacity, int)
+            or listener_queue_capacity < 1
+        ):
+            raise ValueError("listener_queue_capacity must be a positive integer")
         _install_http_log_redaction()
         self._url = url.rstrip("/")
         self._request_timeout = request_timeout
         self._poll_timeout = poll_timeout
         self._max_poll_events = max_poll_events
+        self._max_sessions = max_sessions
         self._client = client
         self._owns_client = client is None
         self._open = client is not None
@@ -123,6 +136,11 @@ class HttpTransportClient:
         self._poll_credentials: dict[int, dict[str, str]] = {}
         self._pending: dict[str, _Pending] = {}
         self._pending_slots = asyncio.Semaphore(max_pending_transactions)
+        self._session_slots = asyncio.BoundedSemaphore(max_sessions)
+        self._listener_queue: asyncio.Queue[Awaitable[object]] = asyncio.Queue(
+            maxsize=listener_queue_capacity
+        )
+        self._listener_task: asyncio.Task[None] | None = None
         self._state_lock = asyncio.Lock()
         self._rid = itertools.count(time.time_ns() // 1_000_000)
         from jrtc.messaging import JanusResponseDispatcher
@@ -138,6 +156,7 @@ class HttpTransportClient:
             "resolved": 0,
             "errors": 0,
             "events": 0,
+            "listener_dropped": 0,
         }
 
     @property
@@ -181,6 +200,8 @@ class HttpTransportClient:
         async with self._state_lock:
             self._open = False
             pollers, self._pollers = tuple(self._pollers.values()), {}
+            for _poller in pollers:
+                self._session_slots.release()
             for poller in pollers:
                 poller.cancel()
             if pollers:
@@ -191,6 +212,11 @@ class HttpTransportClient:
                 if not pending.future.done():
                     pending.future.set_exception(error)
             self._pending.clear()
+            callback_worker, self._listener_task = self._listener_task, None
+            if callback_worker is not None and callback_worker is not asyncio.current_task():
+                callback_worker.cancel()
+                await asyncio.gather(callback_worker, return_exceptions=True)
+            self._discard_listener_queue()
             client = self._client
             if self._owns_client:
                 self._client = None
@@ -237,16 +263,24 @@ class HttpTransportClient:
             raise ValueError("timeout must be finite and greater than zero")
         transaction = message.transaction
         future: asyncio.Future[JanusResponse] | None = None
+        session_slot_acquired = False
         try:
             async with asyncio.timeout(effective):
+                if isinstance(message, (CreateSessionRequest, ClaimSessionRequest)):
+                    await self._session_slots.acquire()
+                    session_slot_acquired = True
                 async with self._pending_slots:
                     if not self.open or self._client is None:
                         raise JanusConnectionClosed("Janus HTTP transport is not open")
                     if transaction in self._pending:
                         raise JanusProtocolError(f"duplicate in-flight transaction {transaction!r}")
                     future = asyncio.get_running_loop().create_future()
-                    self._pending[transaction] = _Pending(future, wait_for_event)
                     session_id, _handle_id = self._ids(message)
+                    self._pending[transaction] = _Pending(
+                        future,
+                        session_id,
+                        wait_for_event,
+                    )
                     if session_id in self._poll_credentials:
                         self._poll_credentials[session_id] = self._credentials(message)
                     try:
@@ -281,8 +315,11 @@ class HttpTransportClient:
                             if parsed.data is not None
                             else None
                         )
-                        if activated_id is not None:
-                            self._start_poller(activated_id, message)
+                        if activated_id is not None and self._start_poller(
+                            activated_id,
+                            message,
+                        ):
+                            session_slot_acquired = False
 
                     result = await future
                     if isinstance(message, DestroySessionRequest):
@@ -291,6 +328,8 @@ class HttpTransportClient:
         except TimeoutError as exc:
             raise JanusRequestTimeout(transaction, effective) from exc
         finally:
+            if session_slot_acquired:
+                self._session_slots.release()
             if future is not None:
                 pending = self._pending.get(transaction)
                 if pending is not None and pending.future is future:
@@ -298,25 +337,41 @@ class HttpTransportClient:
                 if not future.done():
                     future.cancel()
 
-    def _start_poller(self, session_id: JanusId, request: JanusRequest) -> None:
+    def _start_poller(self, session_id: JanusId, request: JanusRequest) -> bool:
         if session_id in self._pollers:
-            return
+            return False
+        if len(self._pollers) >= self._max_sessions:
+            raise JanusTransportError("Janus HTTP session capacity was exhausted")
         self._poll_credentials[session_id] = self._credentials(request)
         self._pollers[session_id] = asyncio.create_task(
             self._poll(session_id), name=f"janus-http-poll-{session_id}"
         )
+        return True
 
     async def _stop_poller(self, session_id: JanusId) -> None:
         task = self._pollers.pop(session_id, None)
         self._poll_credentials.pop(session_id, None)
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if task is not None:
+            self._session_slots.release()
+            if task is not asyncio.current_task():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     async def release_session(self, session_id: JanusId) -> None:
         """Stop long-poll ownership after a session's local lifecycle ends."""
 
         await self._stop_poller(validate_janus_id(session_id, name="session_id"))
+
+    def abort_session(self, session_id: JanusId, error: Exception) -> None:
+        """Fail pending HTTP transactions for one invalidated session."""
+
+        session_id = validate_janus_id(session_id, name="session_id")
+        for transaction, pending in tuple(self._pending.items()):
+            if pending.session_id != session_id:
+                continue
+            if not pending.future.done():
+                pending.future.set_exception(error)
+            self._pending.pop(transaction, None)
 
     async def _poll(self, session_id: JanusId) -> None:
         delay = 0.25
@@ -372,6 +427,7 @@ class HttpTransportClient:
             if self._pollers.get(session_id) is asyncio.current_task():
                 self._pollers.pop(session_id, None)
                 self._poll_credentials.pop(session_id, None)
+                self._session_slots.release()
 
     @staticmethod
     def _credentials(request: JanusRequest) -> dict[str, str]:
@@ -411,7 +467,7 @@ class HttpTransportClient:
             return None
         return key, pending
 
-    async def _resolve_ack(self, response: JanusResponse) -> None:
+    def _resolve_ack(self, response: JanusResponse) -> None:
         entry = self._pending_response(response.transaction)
         if entry is None:
             return
@@ -422,7 +478,7 @@ class HttpTransportClient:
         self._pending.pop(transaction, None)
         self._metrics["resolved"] += 1
 
-    async def _resolve_error(self, response: JanusResponse) -> None:
+    def _resolve_error(self, response: JanusResponse) -> None:
         error_payload = getattr(response, "error", None)
         if error_payload is None:
             return
@@ -445,7 +501,7 @@ class HttpTransportClient:
             )
         self._metrics["errors"] += 1
 
-    async def _resolve_transaction(self, response: JanusResponse) -> None:
+    def _resolve_transaction(self, response: JanusResponse) -> None:
         entry = self._pending_response(response.transaction)
         if entry is not None:
             transaction, pending = entry
@@ -453,14 +509,20 @@ class HttpTransportClient:
             self._pending.pop(transaction, None)
             self._metrics["resolved"] += 1
         if response.janus in self._dispatcher.dispatchable_events:
-            await self._notify_message(response)
+            self._notify_message(response)
 
-    async def _notify_message(self, response: JanusResponse) -> None:
+    def _notify_message(self, response: JanusResponse) -> None:
         for listener in tuple(self._message_listeners):
             try:
                 result = listener(response)
                 if inspect.isawaitable(result):
-                    await result
+                    self._admit_listener_awaitable(result)
+            except asyncio.CancelledError as exc:
+                logger.error(
+                    "Local listener failed",
+                    "Janus HTTP message listener raised cancellation",
+                    context={"error_type": type(exc).__name__, "janus_type": response.janus},
+                )
             except Exception as exc:
                 logger.error(
                     "Local listener failed",
@@ -468,6 +530,58 @@ class HttpTransportClient:
                     context={"error_type": type(exc).__name__, "janus_type": response.janus},
                     exc_info=exc,
                 )
+
+    def _admit_listener_awaitable(self, result: Awaitable[object]) -> None:
+        try:
+            self._listener_queue.put_nowait(result)
+        except asyncio.QueueFull:
+            self._metrics["listener_dropped"] += 1
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            return
+        if self._listener_task is None or self._listener_task.done():
+            self._listener_task = asyncio.create_task(
+                self._drain_listener_queue(),
+                name="janus-http-listener-callbacks",
+            )
+
+    async def _drain_listener_queue(self) -> None:
+        while True:
+            try:
+                result = self._listener_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await result
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                if task is not None and task.cancelling():
+                    raise
+                logger.warning(
+                    "Local listener cancelled",
+                    "A Janus HTTP transport listener cancelled its own awaitable",
+                )
+            except Exception as exc:
+                logger.error(
+                    "Local listener failed",
+                    "A deferred Janus HTTP transport listener raised",
+                    context={"error_type": type(exc).__name__},
+                    exc_info=exc,
+                )
+            finally:
+                self._listener_queue.task_done()
+
+    def _discard_listener_queue(self) -> None:
+        while True:
+            try:
+                result = self._listener_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            self._listener_queue.task_done()
 
     async def _notify_close(self, error: BaseException | None) -> None:
         for listener in tuple(self._close_listeners):

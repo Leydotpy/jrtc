@@ -12,7 +12,13 @@ from jrtc.messaging import (
     create_broker,
 )
 from jrtc.models import JanusId, JanusRequest, JanusResponse
-from jrtc.session import JanusSession, SessionState, WebsocketSession
+from jrtc.session import (
+    JanusSession,
+    SessionLoss,
+    SessionLossHandler,
+    SessionState,
+    WebsocketSession,
+)
 from jrtc.transport import JanusTransport, WebsocketTransportClient
 
 try:
@@ -34,6 +40,8 @@ __all__ = (
     "JanusTransport",
     "LogVistaMetrics",
     "Plugin",
+    "SessionLoss",
+    "SessionLossHandler",
     "SessionState",
     "WebsocketSession",
     "WebsocketTransportClient",

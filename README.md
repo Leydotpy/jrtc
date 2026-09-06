@@ -110,7 +110,12 @@ async with JanusSession(url="http://127.0.0.1:8088/janus") as session:
 ```
 
 WebSocket disconnects invalidate every session and handle bound to that socket.
-The manager creates fresh sessions rather than silently reusing stale Janus IDs.
+Loss is reported synchronously to the session manager, which is the sole recovery
+owner and deduplicates replacement by pool slot and generation. The periodic
+health sweep is only a safety net. The manager creates fresh sessions rather than
+silently reusing stale Janus IDs. Built-in transports also fail pending requests
+for the lost session without disturbing other sessions multiplexed on the same
+transport.
 Janus-generated `session_id`, `handle_id`, event `sender`, and success `data.id`
 values are strict positive Python integers throughout the runtime; numeric
 strings and booleans are rejected at protocol and lifecycle boundaries.
@@ -139,11 +144,20 @@ treated as shared and remains owned by the host application.
 
 ## Brokered WebRTC events
 
-Inbound responses are coordinated once by a frozen Dispio dispatcher. ACK,
-error, and transaction responses stay local; asynchronous Janus responses are
-admitted directly from either transport to a bounded, ordered Broka publisher.
-They do not pass through plugin callbacks on their way to third-party
-applications, and ReactiveX is not part of the runtime.
+Inbound responses are coordinated once by a frozen Dispio dispatcher. Transaction
+state is resolved first, plugin-local work is admitted to its bounded handle queue
+second, and global publication is attempted last with the synchronous
+`publisher.try_admit(...)` API. That call never waits for capacity and retains only
+the validated response reference; JSON normalization and broker work happen in a
+fixed background worker pool. The awaited `publisher.admit(...)` API remains for
+non-hot-path callers that intentionally accept a finite capacity wait. ReactiveX
+is not part of the runtime.
+
+When global ingress is full, normal events reject newest, repeated media/slow-link
+telemetry can coalesce by generic session/handle state key, and protected lifecycle
+events can evict the oldest queued non-protected event. In-flight or all-protected
+capacity can still reject a protected event; core does not claim durable delivery
+without an application-owned durable outbox.
 
 Every event uses a logical type such as `janus.event` or `janus.media`, mapped
 to one portable physical destination, `janus.events`. JSEP remains embedded in
@@ -255,6 +269,22 @@ await echo.attach()
 
 Direct construction of the concrete class is preferred because it gives type
 checkers the plugin-specific methods and result types.
+
+### Batched ICE trickling
+
+`Plugin.trickle()` accepts either one `TrickleCandidate` or a sequence. One
+candidate uses Janus's singular `candidate` field; a sequence is sent once in the
+plural `candidates` field in the original order. An empty sequence is invalid and
+the defensive protocol ceiling is 256 candidates.
+
+```python
+await plugin.trickle(candidates)  # one Janus transaction for the whole batch
+await plugin.complete_trickle()   # singular {"completed": true} marker
+```
+
+Both calls use transport-level completion (`wait_for_event=False`). An empty batch
+never means completion; applications with a final non-empty batch send that batch
+and then call `complete_trickle()` explicitly.
 
 ## Implementing a custom plugin
 
@@ -449,19 +479,26 @@ uv run pytest
 uv run ruff check src tests
 uv run ruff format --check src tests
 uv run mypy src/jrtc
+uv run python benchmarks/control_plane.py
 uv build
 ```
 
-The tracked tests cover response validation, local plugin lifecycle, complete
-ReactiveX removal, bounded publisher concurrency and draining, real Broka
-memory delivery, Dispio response selection, and one-envelope JSEP behavior for
-both built-in transports. Live Janus and external broker tests should also run
-against the exact versions used in each deployment.
+The tracked tests cover response validation, ICE batching and completion,
+notification-driven recovery races, stale-handle fencing, local plugin overload,
+publisher priority/coalescing/retry/shutdown behavior, stalled-broker isolation,
+real Broka memory delivery, Dispio response selection, and one-envelope JSEP
+behavior for both built-in transports. The in-process benchmark exercises session
+pool sizes 1/2/4, broker stalls, event storms, and ICE batch sizes 1/4/8/16/32.
+Live Janus and external broker tests should also run against the exact versions
+used in each deployment.
 
 See the
 [broker event guide](https://github.com/Leydotpy/Janus-API/blob/main/docs/broker-events.md)
 for ownership, event contracts, backend subscription topology, reliability,
-and deployment limits.
+and deployment limits. The
+[control-plane performance notes](docs/control-plane-performance.md) record the
+implemented invariants, benchmark command, overload evidence, and remaining live
+deployment checks.
 
 ## 3.1 messaging migration
 
@@ -469,6 +506,11 @@ and deployment limits.
   bounded instance-owned queues; cross-process subscribers use Broka.
 - Dispio now coordinates ACK, error, transaction, and asynchronous response
   handling without a transport `if`/`elif` decision tree.
+- Transport event ingress is non-waiting; serialization and bounded retries are
+  owned by publisher workers with explicit priority and overflow accounting.
+- Session loss is notification-driven and replacement has one generation-fenced
+  owner; the monitor remains a fallback detector.
+- ICE sequences remain one ordered plural request and completion stays explicit.
 - JSEP is delivered only inside its original response and is never dispatched
   as a separate SDP event.
 - Python 3.12 or newer is required by the pinned messaging dependencies.

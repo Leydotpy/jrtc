@@ -202,14 +202,27 @@ class JanusResponseDispatcher:
         sender: JanusIdentifier | None = None,
     ) -> bool:
         await self._invoke(self.on_transaction, response, callback="transaction")
-        await self.listeners.notify(response.janus, response)
+        # Callback execution is owned by a bounded listener worker. Admission
+        # itself is immediate, so a slow application listener cannot stall the
+        # transport reader or delay global ingress.
+        self.listeners.try_notify(response.janus, response)
         if self.publisher is None:
             return False
-        return await self.publisher.admit(
+        return self.publisher.try_admit(
             response,
             session_id=session_id,
             sender=sender,
         )
+
+    async def aclose(
+        self,
+        *,
+        drain_listeners: bool = False,
+        timeout: float | None = None,
+    ) -> None:
+        """Settle the bounded local-listener worker during transport teardown."""
+
+        await self.listeners.aclose(drain=drain_listeners, timeout=timeout)
 
     async def _invoke(
         self,

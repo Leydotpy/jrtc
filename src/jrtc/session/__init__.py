@@ -1,6 +1,11 @@
 """Janus session types."""
 
-from jrtc.session.base import AbstractBaseSession, SessionState
+from jrtc.session.base import (
+    AbstractBaseSession,
+    SessionLoss,
+    SessionLossHandler,
+    SessionState,
+)
 from jrtc.session.websocket import JanusSession, WebsocketSession
 
 
@@ -18,6 +23,8 @@ __all__ = (
     "AbstractBaseSession",
     "JanusSession",
     "JanusSessionManager",
+    "SessionLoss",
+    "SessionLossHandler",
     "SessionState",
     "WebsocketSession",
 )

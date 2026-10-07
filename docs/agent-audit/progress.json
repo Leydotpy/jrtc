@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "audit_date": "2026-10-07",
+  "repository": "Leydotpy/jrtc",
+  "scope": "/",
+  "audited_branch": "main",
+  "audited_commit": "de64c1e02b550049c8253fdef7d47a87b765c9e8",
+  "instruction_revision": "2026-10-07.1",
+  "contract_revision": "2026-10-07.1",
+  "source_requirements_sha256": "96a82d2022cbbbc50b69371a87cadf9f5118293a7b4dd29deb0f7547628f3c0c",
+  "audit_deliverable": {
+    "status": "ready_for_review",
+    "scope": "AGENTS instructions, requirement audit and verification evidence only",
+    "application_changes_in_this_revision": false
+  },
+  "groups": [
+    {
+      "id": "C01",
+      "sections": [
+        0,
+        1,
+        2
+      ],
+      "title": "Generic ownership boundaries",
+      "implementation_status": "policy",
+      "verification_status": "source_review",
+      "note": "No Synq/Django business logic belongs in core. Generic Broka integration is intentionally present; the original mission sentence forbidding Broka assumptions must not be interpreted as removing that integration.",
+      "evidence": [
+        "pyproject.toml",
+        "src/jrtc/messaging/factory.py"
+      ]
+    },
+    {
+      "id": "C02",
+      "sections": [
+        3,
+        4,
+        5,
+        6,
+        20
+      ],
+      "title": "Non-waiting response and publication ingress",
+      "implementation_status": "present",
+      "verification_status": "source_review",
+      "note": "Dispatcher resolves transactions then queues listeners and calls try_admit; serialization is deferred to publisher workers. Source tests cover full ingress, stalled brokers, ACK/final events, ordering and publisher exceptions.",
+      "evidence": [
+        "src/jrtc/messaging/dispatcher.py#async def _handle_dispatchable",
+        "src/jrtc/messaging/publisher.py#def try_admit",
+        "src/jrtc/messaging/listeners.py#def try_notify",
+        "tests/test_realtime_ingress.py"
+      ]
+    },
+    {
+      "id": "C03",
+      "sections": [
+        7,
+        8,
+        9,
+        21
+      ],
+      "title": "Bounded overload, priority and retry behavior",
+      "implementation_status": "present",
+      "verification_status": "source_review",
+      "note": "Global slots include queued/in-flight work, worker queues are bounded, telemetry coalesces, protected events can evict normal work, and publish retries/deadlines are finite. Protected events can still be lost when all slots are protected/in flight.",
+      "evidence": [
+        "src/jrtc/messaging/publisher.py",
+        "tests/test_realtime_ingress.py#test_protected_event_is_rejected_when_all_capacity_is_in_flight"
+      ]
+    },
+    {
+      "id": "C04",
+      "sections": [
+        10,
+        11,
+        12,
+        13,
+        22
+      ],
+      "title": "Generic ICE request contract",
+      "implementation_status": "present",
+      "verification_status": "source_review",
+      "note": "Single candidate versus ordered sequence, explicit singular completion, exactly-one container validation, strict fields, 256 ceiling and wait_for_event=False are present with focused tests.",
+      "evidence": [
+        "src/jrtc/models/request.py#class TrickleCandidate",
+        "src/jrtc/models/request.py#class TrickleRequest",
+        "src/jrtc/lib/plugins/base.py#async def trickle",
+        "tests/test_ice_contract.py"
+      ]
+    },
+    {
+      "id": "C05",
+      "sections": [
+        14,
+        15,
+        23
+      ],
+      "title": "Single-owner recovery and generation fencing",
+      "implementation_status": "present",
+      "verification_status": "source_review",
+      "note": "Session invalidates plugin handles synchronously; one manager callback schedules generation-fenced replacement. Tests cover concurrent loss signals, shutdown and scoped transaction abort.",
+      "evidence": [
+        "src/jrtc/session/base.py#def _invalidate",
+        "src/jrtc/manager.py#def _request_recovery",
+        "tests/test_session_recovery.py"
+      ]
+    },
+    {
+      "id": "C06",
+      "sections": [
+        16
+      ],
+      "title": "Session reclaim",
+      "implementation_status": "deferred",
+      "verification_status": "source_review",
+      "note": "The brief explicitly defers reclaim/adoption as a later resilience phase. Do not count safe replacement instead of reclaim as missing work.",
+      "evidence": [
+        "src/jrtc/session/base.py",
+        "src/jrtc/manager.py"
+      ]
+    },
+    {
+      "id": "C07",
+      "sections": [
+        17,
+        24,
+        25
+      ],
+      "title": "Metrics, benchmark scenarios and pool evidence",
+      "implementation_status": "partial",
+      "verification_status": "external_not_verified",
+      "note": "Metrics and an in-process benchmark exist. Repository notes record a prior Python/Windows run and explicitly reserve live Janus/broker measurements. Those results were not rerun here and do not certify Synq or production capacity.",
+      "evidence": [
+        "src/jrtc/transport/websocket.py#def metrics",
+        "src/jrtc/manager.py#def metrics",
+        "benchmarks/control_plane.py",
+        "docs/control-plane-performance.md"
+      ]
+    },
+    {
+      "id": "C08",
+      "sections": [
+        18,
+        19
+      ],
+      "title": "Safe logging and measured serialization changes",
+      "implementation_status": "present",
+      "verification_status": "source_review",
+      "note": "Hot-path diagnostics expose metadata, worker serialization is explicit, and existing notes report profiling rather than a speculative serializer rewrite. Preserve bounded metric cardinality and nonblocking callback contracts.",
+      "evidence": [
+        "src/jrtc/transport/websocket.py#async def _process_message",
+        "src/jrtc/messaging/publisher.py",
+        "tests/test_realtime_ingress.py#test_janus_error_diagnostics_never_log_the_response_payload",
+        "docs/control-plane-performance.md"
+      ]
+    },
+    {
+      "id": "C09",
+      "sections": [
+        26
+      ],
+      "title": "Additive API compatibility",
+      "implementation_status": "present",
+      "verification_status": "source_review",
+      "note": "Awaited admit remains alongside try_admit; sequence trickle and subclass contracts remain. Package compatibility still needs tests against built artifacts and consumers.",
+      "evidence": [
+        "src/jrtc/messaging/publisher.py#async def admit",
+        "src/jrtc/lib/plugins/base.py",
+        "tests/test_ice_contract.py"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "C-T01",
+      "title": "Re-run the implemented core invariants",
+      "priority": "P1",
+      "dependencies": [],
+      "scope": "existing core tests; installed dependency matrix",
+      "acceptance": "Run the full Python suite, type/lint/build gates and focused ingress/ICE/recovery tests with real pinned Broka/Dispio. Record commit and versions. Do not rebuild already-present ingress or recovery abstractions. Confirm true means an exact queue slot; false includes coalescing, and neither guarantees durable delivery.",
+      "status": "not_started",
+      "implementation_commit": null,
+      "verification_evidence": [],
+      "review_status": "not_requested"
+    },
+    {
+      "id": "C-T02",
+      "title": "Define an application loss-observer contract",
+      "priority": "P1",
+      "dependencies": [],
+      "scope": "manager/session public lifecycle API and consumer integration",
+      "acceptance": "Document the existing single recovery-owner rule. If Synq requires proactive application observation beyond current health checks, add a separate bounded observer interface with tests; do not repurpose set_loss_handler. Synchronous handle fencing remains immediate, observers cannot replace sessions or await persistence on the reader, and shutdown unsubscribes them. Mark the API proposed until implemented and released.",
+      "status": "not_started",
+      "implementation_commit": null,
+      "verification_evidence": [],
+      "review_status": "not_requested"
+    },
+    {
+      "id": "C-T03",
+      "title": "Collect load and release compatibility evidence",
+      "priority": "P2",
+      "dependencies": [
+        "C-T01"
+      ],
+      "scope": "benchmark harness; external Janus/brokers; package release",
+      "acceptance": "Run matched healthy/stalled/event-storm/ICE workloads and 1/2/4 pools, recording p50/p95/p99, loop lag, CPU/RSS, queue high-water marks, drops, recovery duration and versions. Account for receive frame size times outstanding capacity and mutable payload ownership. Profile worst-case protected eviction/coalescing before optimizing. Verify supported Python versions and published wheels; retain default pool size until evidence supports a change.",
+      "status": "not_started",
+      "implementation_commit": null,
+      "verification_evidence": [],
+      "review_status": "not_requested"
+    }
+  ],
+  "verification_limits": "Full Python tests and benchmarks were not run. An offline dependency attempt failed because broka==0.0.2 was absent from cache; pytest, dispio and logvista were also unavailable in the base runtime. Source tests and prior benchmark notes were inspected, not relabeled as fresh passes.",
+  "cross_repository_dependencies": {
+    "synq": {
+      "repo": "synq",
+      "branch": "v4",
+      "sha": "2d8682701300f27ab3771e9ea72413b3f7631a49",
+      "tree": "f0f72982ff3da0c11c3d555b07836e5a171acede"
+    },
+    "jrtc": {
+      "repo": "jrtc",
+      "branch": "main",
+      "sha": "de64c1e02b550049c8253fdef7d47a87b765c9e8",
+      "tree": "20fad7a45b261dd2f77e9bfd847b0cae2a78c38d"
+    },
+    "jrtc-plugins": {
+      "repo": "jrtc-plugins",
+      "branch": "main",
+      "sha": "bec03a533ab3af33c1deef822e8249f123a007dc",
+      "tree": "49bf501508a0faa60c0007ee17edd63c29aae418"
+    },
+    "synq.js": {
+      "repo": "synq.js",
+      "branch": "codex/batched-ice-meeting-sounds",
+      "sha": "da471c92989ccf28a26de14d6ec4d1356c647bed",
+      "tree": "df332f1cbcfe6084f86e17a436f31054a88461d3"
+    }
+  }
+}

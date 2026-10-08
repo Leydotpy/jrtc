@@ -538,3 +538,18 @@ deployment checks.
 ## License
 
 MIT
+
+## Application observation of session loss (3.2.0)
+
+`session.add_loss_observer(callback)` adds an application observer and returns an
+idempotent unsubscribe function. The recovery owner still uses `set_loss_handler`;
+observers cannot replace it. At most 16 registrations are retained per session,
+and local shutdown clears them. Notifications carry `SessionLoss` metadata only.
+They run after handle fencing and manager notification, on the session loop.
+Callbacks must be synchronous and nonblocking: enqueue into a bounded application
+worker, never perform database/network work or start another recovery loop.
+Exceptions are isolated and counted in `loss_observer_failures`. Losses are not
+replayed to newly registered observers.
+
+Standalone test runs skip the optional operations-server checkout checks when
+`jsrv` is absent. Set `JRTC_JSRV_ROOT` to its real checkout to run those checks.

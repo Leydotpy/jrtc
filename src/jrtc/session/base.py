@@ -167,10 +167,11 @@ class AbstractBaseSession:
         self._lost_session_id: JanusId | None = None
         self._generation = 0
         self._loss_handler: SessionLossHandler | None = None
+        self._loss_observers: dict[object, SessionLossHandler] = {}
         # Loss invalidation is idempotent and recreation waits for cleanup, so
         # one session can own at most one generation-cleanup task.
         self._cleanup_task: asyncio.Task[None] | None = None
-        self._metrics = {"session_losses": 0}
+        self._metrics = {"session_losses": 0, "loss_observer_failures": 0}
         self._event_dispatcher = Dispatcher(name="janus.session.events")
         self._event_dispatcher.add(
             ExactMatcher("timeout"),
@@ -250,6 +251,28 @@ class AbstractBaseSession:
 
         if self._loss_handler is handler:
             self._loss_handler = None
+
+    def add_loss_observer(self, observer: SessionLossHandler) -> Callable[[], None]:
+        """Observe future losses without taking ownership of recovery.
+
+        At most 16 registrations are retained per session. Callbacks run after
+        synchronous handle fencing and the manager notification, on the owner
+        loop. They must do constant-time, nonblocking work: enqueue metadata in
+        a bounded application worker, never perform I/O or replace sessions.
+        The returned unsubscribe function is idempotent. No losses are replayed.
+        """
+
+        if not callable(observer) or inspect.iscoroutinefunction(observer):
+            raise TypeError("session loss observer must be a synchronous callable")
+        if len(self._loss_observers) >= 16:
+            raise RuntimeError("session loss observer limit reached")
+        key = object()
+        self._loss_observers[key] = observer
+
+        def unsubscribe() -> None:
+            self._loss_observers.pop(key, None)
+
+        return unsubscribe
 
     async def _setup(self) -> None:
         async with self._setup_lock:
@@ -457,6 +480,24 @@ class AbstractBaseSession:
                     exc_info=exc,
                 )
 
+        for key, observer in tuple(self._loss_observers.items()):
+            if key not in self._loss_observers:
+                continue
+            try:
+                result = observer(loss)
+                if inspect.isawaitable(result):
+                    close = getattr(result, "close", None)
+                    if callable(close):
+                        close()
+                    raise TypeError("session loss observers must not return awaitables")
+            except Exception as exc:
+                self._metrics["loss_observer_failures"] += 1
+                logger.warning(
+                    "Session loss observer failed",
+                    "Application observer did not accept lifecycle metadata",
+                    context={"error_type": type(exc).__name__, "generation": loss.generation},
+                )
+
         lost_transport = self._transport
 
         async def cleanup_lost_generation() -> None:
@@ -520,6 +561,7 @@ class AbstractBaseSession:
         )
 
     async def _close_local(self) -> None:
+        self._loss_observers.clear()
         self._unregister_transport_listeners()
         plugins = tuple(self._plugins.as_dict().values())
         self._plugins.clear()

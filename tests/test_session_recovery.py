@@ -245,6 +245,55 @@ def test_session_allows_only_one_recovery_owner() -> None:
     session.set_loss_handler(second)
 
 
+async def test_loss_observers_are_fenced_bounded_and_independent_of_recovery() -> None:
+    session = JanusSession(transport=_SessionTransport())
+    session._session_id = 77
+    session._state = SessionState.ACTIVE
+    plugin = _SessionPlugin(session=session, plugin_id=12)
+    session.plugins.register(12, plugin)
+    calls: list[str] = []
+    session.set_loss_handler(lambda loss: calls.append("owner"))
+
+    def observe(_loss: SessionLoss) -> None:
+        assert len(session.plugins) == 0
+        assert session.state is SessionState.LOST
+        calls.append("observer")
+
+    unsubscribe = session.add_loss_observer(observe)
+    removed = session.add_loss_observer(lambda loss: calls.append("removed"))
+    removed()
+    removed()
+
+    def broken(_loss: SessionLoss) -> None:
+        raise RuntimeError("observer failure")
+
+    remove_broken = session.add_loss_observer(broken)
+    rest = [session.add_loss_observer(lambda loss: None) for _ in range(14)]
+    with pytest.raises(RuntimeError, match="observer limit"):
+        session.add_loss_observer(observe)
+    session._invalidate("test loss")
+    session._invalidate("duplicate loss")
+    assert calls == ["owner", "observer"]
+    assert session.metrics["loss_observer_failures"] == 1
+    unsubscribe()
+    remove_broken()
+    for remove in rest:
+        remove()
+    assert session._loss_observers == {}
+    await session._drain_cleanup_tasks()
+    await session.destroy()
+
+
+def test_async_loss_observer_is_rejected_without_scheduling_work() -> None:
+    session = JanusSession(transport=_SessionTransport())
+
+    async def observe(_loss: SessionLoss) -> None:
+        pass
+
+    with pytest.raises(TypeError, match="synchronous"):
+        session.add_loss_observer(observe)  # type: ignore[arg-type]
+
+
 class _SendConnection:
     def __init__(self, capacity: int = 1) -> None:
         self.sent: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=capacity)

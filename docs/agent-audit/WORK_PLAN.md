@@ -1,14 +1,16 @@
 # JRTC core — concern-by-concern work plan
 
-The audit/instruction change is ready for review. The implementation tasks below are **not started by this documentation change**. Existing code is credited in requirements.csv; tasks describe the remaining corrections or verification, not a request to repeat completed features.
+Implementation update 2026-10-08: local implementations and evidence are ready for review; the final live acceptance task remains blocked. See [IMPLEMENTATION.md](IMPLEMENTATION.md). The audit-only statement below describes the historical documentation change.
+
+The audit/instruction change is ready for review. The initial audit left the tasks pending. Current implementation evidence is in [IMPLEMENTATION.md](IMPLEMENTATION.md). Existing code is credited in requirements.csv; tasks describe the remaining corrections or verification, not a request to repeat completed features.
 
 Task IDs are unique across the four repositories: S=Synq, F=frontend, C=core, V=VideoRoom. A dependency in another repository refers to that repository's WORK_PLAN.md. Dependencies gate integration/release; isolated test preparation may proceed earlier. No task requires automatic delegation to other agents.
 
 | Task | Priority | Dependencies | State |
 | --- | --- | --- | --- |
-| C-T01 — Re-run the implemented core invariants | P1 | None | not_started |
-| C-T02 — Define an application loss-observer contract | P1 | None | not_started |
-| C-T03 — Collect load and release compatibility evidence | P2 | C-T01 | not_started |
+| C-T01 — Re-run the implemented core invariants | P1 | None | ready_for_review |
+| C-T02 — Define an application loss-observer contract | P1 | None | ready_for_review |
+| C-T03 — Collect load and release compatibility evidence | P2 | C-T01 | blocked |
 
 ## C-T01 — Re-run the implemented core invariants
 

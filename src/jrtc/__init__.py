@@ -24,7 +24,7 @@ from jrtc.transport import JanusTransport, WebsocketTransportClient
 try:
     __version__ = version("jrtc")
 except PackageNotFoundError:  # source checkout
-    __version__ = "3.1.1"
+    __version__ = "3.2.0"
 
 
 __all__ = (

@@ -177,10 +177,13 @@
       "dependencies": [],
       "scope": "existing core tests; installed dependency matrix",
       "acceptance": "Run the full Python suite, type/lint/build gates and focused ingress/ICE/recovery tests with real pinned Broka/Dispio. Record commit and versions. Do not rebuild already-present ingress or recovery abstractions. Confirm true means an exact queue slot; false includes coalescing, and neither guarantees durable delivery.",
-      "status": "not_started",
-      "implementation_commit": null,
-      "verification_evidence": [],
-      "review_status": "not_requested"
+      "status": "ready_for_review",
+      "implementation_commit": "b0998af03c0702302855cc7c52c3dd53ac7a32af",
+      "verification_evidence": [
+        "docs/agent-audit/IMPLEMENTATION.md"
+      ],
+      "review_status": "pending_maintainer_review",
+      "branch": "codex/implement-agent-plan-2026-10-08"
     },
     {
       "id": "C-T02",
@@ -189,10 +192,13 @@
       "dependencies": [],
       "scope": "manager/session public lifecycle API and consumer integration",
       "acceptance": "Document the existing single recovery-owner rule. If Synq requires proactive application observation beyond current health checks, add a separate bounded observer interface with tests; do not repurpose set_loss_handler. Synchronous handle fencing remains immediate, observers cannot replace sessions or await persistence on the reader, and shutdown unsubscribes them. Mark the API proposed until implemented and released.",
-      "status": "not_started",
-      "implementation_commit": null,
-      "verification_evidence": [],
-      "review_status": "not_requested"
+      "status": "ready_for_review",
+      "implementation_commit": "b0998af03c0702302855cc7c52c3dd53ac7a32af",
+      "verification_evidence": [
+        "docs/agent-audit/IMPLEMENTATION.md"
+      ],
+      "review_status": "pending_maintainer_review",
+      "branch": "codex/implement-agent-plan-2026-10-08"
     },
     {
       "id": "C-T03",
@@ -203,10 +209,14 @@
       ],
       "scope": "benchmark harness; external Janus/brokers; package release",
       "acceptance": "Run matched healthy/stalled/event-storm/ICE workloads and 1/2/4 pools, recording p50/p95/p99, loop lag, CPU/RSS, queue high-water marks, drops, recovery duration and versions. Account for receive frame size times outstanding capacity and mutable payload ownership. Profile worst-case protected eviction/coalescing before optimizing. Verify supported Python versions and published wheels; retain default pool size until evidence supports a change.",
-      "status": "not_started",
-      "implementation_commit": null,
-      "verification_evidence": [],
-      "review_status": "not_requested"
+      "status": "blocked",
+      "implementation_commit": "b0998af03c0702302855cc7c52c3dd53ac7a32af",
+      "verification_evidence": [
+        "docs/agent-audit/IMPLEMENTATION.md"
+      ],
+      "review_status": "pending_maintainer_review",
+      "branch": "codex/implement-agent-plan-2026-10-08",
+      "blocker": "Live Janus/broker deployment and published release verification are not available in this workspace; synthetic evidence is recorded separately."
     }
   ],
   "verification_limits": "Full Python tests and benchmarks were not run. An offline dependency attempt failed because broka==0.0.2 was absent from cache; pytest, dispio and logvista were also unavailable in the base runtime. Source tests and prior benchmark notes were inspected, not relabeled as fresh passes.",
@@ -235,5 +245,11 @@
       "sha": "da471c92989ccf28a26de14d6ec4d1356c647bed",
       "tree": "df332f1cbcfe6084f86e17a436f31054a88461d3"
     }
+  },
+  "implementation_revision": {
+    "date": "2026-10-08",
+    "base_commit": "66fceda7530e5d98df01fc7c3b871d30038769f9",
+    "branch": "codex/implement-agent-plan-2026-10-08",
+    "report": "docs/agent-audit/IMPLEMENTATION.md"
   }
 }

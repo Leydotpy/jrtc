@@ -1,0 +1,177 @@
+{
+  "environment": {
+    "note": "in-process structural benchmark; confirm capacity on live Janus/broker",
+    "platform": "Linux-6.18.44-x86_64-with-glibc2.39",
+    "python": "3.12.14"
+  },
+  "scenario_a_transaction_storm": [
+    {
+      "average_dispatch_us": 109.902,
+      "cpu_seconds": 0.5275,
+      "elapsed_seconds": 0.5275,
+      "event_loop_lag": {
+        "maximum_ms": 502.752,
+        "p50_ms": 10.022,
+        "p95_ms": 502.752,
+        "p99_ms": 502.752
+      },
+      "frames_per_second": 3791.4,
+      "outstanding_after": 0,
+      "peak_traced_bytes": 8363241,
+      "receive_to_transaction_resolution": {
+        "average_us": 46.812,
+        "maximum_us": 889.933
+      },
+      "rtt": {
+        "maximum_ms": 504.709,
+        "p50_ms": 398.443,
+        "p95_ms": 496.889,
+        "p99_ms": 502.924
+      },
+      "sessions": 1,
+      "transactions": 2000
+    },
+    {
+      "average_dispatch_us": 101.232,
+      "cpu_seconds": 0.4955,
+      "elapsed_seconds": 0.4955,
+      "event_loop_lag": {
+        "maximum_ms": 462.665,
+        "p50_ms": 19.912,
+        "p95_ms": 462.665,
+        "p99_ms": 462.665
+      },
+      "frames_per_second": 4036.3,
+      "outstanding_after": 0,
+      "peak_traced_bytes": 8125056,
+      "receive_to_transaction_resolution": {
+        "average_us": 45.399,
+        "maximum_us": 1664.131
+      },
+      "rtt": {
+        "maximum_ms": 464.409,
+        "p50_ms": 364.005,
+        "p95_ms": 447.637,
+        "p99_ms": 461.126
+      },
+      "sessions": 2,
+      "transactions": 2000
+    },
+    {
+      "average_dispatch_us": 94.074,
+      "cpu_seconds": 0.5121,
+      "elapsed_seconds": 0.5122,
+      "event_loop_lag": {
+        "maximum_ms": 452.416,
+        "p50_ms": 23.255,
+        "p95_ms": 452.416,
+        "p99_ms": 452.416
+      },
+      "frames_per_second": 3904.8,
+      "outstanding_after": 0,
+      "peak_traced_bytes": 8278960,
+      "receive_to_transaction_resolution": {
+        "average_us": 42.601,
+        "maximum_us": 1227.853
+      },
+      "rtt": {
+        "maximum_ms": 454.078,
+        "p50_ms": 358.036,
+        "p95_ms": 429.494,
+        "p99_ms": 445.732
+      },
+      "sessions": 4,
+      "transactions": 2000
+    }
+  ],
+  "scenario_b_broker_stall": {
+    "average_dispatch_us": 193.482,
+    "cpu_seconds": 0.3527,
+    "elapsed_seconds": 0.3527,
+    "event_loop_lag": {
+      "maximum_ms": 337.981,
+      "p50_ms": 4.545,
+      "p95_ms": 337.981,
+      "p99_ms": 337.981
+    },
+    "frames_per_second": 2835.2,
+    "ingress_capacity": 64,
+    "ingress_depth_while_stalled": 64,
+    "outstanding_after": 0,
+    "p95_delta_ms": 24.56,
+    "peak_traced_bytes": 5479499,
+    "publish_calls": 64,
+    "receive_to_transaction_resolution": {
+      "average_us": 74.237,
+      "maximum_us": 25067.399
+    },
+    "resolution_average_delta_us": 28.845,
+    "rtt": {
+      "maximum_ms": 339.916,
+      "p50_ms": 301.217,
+      "p95_ms": 336.206,
+      "p99_ms": 338.981
+    },
+    "sessions": 1,
+    "transactions": 1000,
+    "transactions_completed_while_broker_stalled": true,
+    "unstalled_baseline_rtt": {
+      "maximum_ms": 317.173,
+      "p50_ms": 261.175,
+      "p95_ms": 311.646,
+      "p99_ms": 315.976
+    }
+  },
+  "scenario_c_event_storm": {
+    "accepted": 64,
+    "admission_events_per_second": 15441.3,
+    "bounded": true,
+    "events": 20000,
+    "peak_traced_bytes": 95980,
+    "queue_capacity": 64,
+    "queue_depth_at_peak": 64,
+    "rejected_or_coalesced": 19936
+  },
+  "scenario_d_batched_ice": [
+    {
+      "batch_size": 1,
+      "candidate_requests": 1024,
+      "candidates": 1024,
+      "elapsed_seconds": 0.00945,
+      "expected_candidate_requests": 1024,
+      "requests_including_completion": 1025
+    },
+    {
+      "batch_size": 4,
+      "candidate_requests": 256,
+      "candidates": 1024,
+      "elapsed_seconds": 0.00262,
+      "expected_candidate_requests": 256,
+      "requests_including_completion": 257
+    },
+    {
+      "batch_size": 8,
+      "candidate_requests": 128,
+      "candidates": 1024,
+      "elapsed_seconds": 0.00136,
+      "expected_candidate_requests": 128,
+      "requests_including_completion": 129
+    },
+    {
+      "batch_size": 16,
+      "candidate_requests": 64,
+      "candidates": 1024,
+      "elapsed_seconds": 0.00077,
+      "expected_candidate_requests": 64,
+      "requests_including_completion": 65
+    },
+    {
+      "batch_size": 32,
+      "candidate_requests": 32,
+      "candidates": 1024,
+      "elapsed_seconds": 0.0005,
+      "expected_candidate_requests": 32,
+      "requests_including_completion": 33
+    }
+  ]
+}

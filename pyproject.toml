@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 # The product is called "Janus Core". The exact `janus-core` distribution and
 # `janus_core` import namespace are already owned by an unrelated PyPI project.
 name = "jrtc"
-version = "3.2.0"
+version = "3.3.0"
 description = "Plugin-agnostic async Python core for the Janus WebRTC Gateway"
 authors = [{ name = "Leydotpy", email = "leydotpy.dev@gmail.com" }]
 license = "MIT"
